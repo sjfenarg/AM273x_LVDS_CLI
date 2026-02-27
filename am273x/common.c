@@ -403,7 +403,7 @@ void Mmwave_populateDefaultOpenCfg (MMWave_OpenCfg* ptrOpenCfg)
     ptrOpenCfg->dataPathCfg.intfSel         = 0;
     ptrOpenCfg->dataPathCfg.transferFmtPkt0 = 1;
     ptrOpenCfg->dataPathCfg.transferFmtPkt1 = 0;
-    ptrOpenCfg->dataPathCfg.cqConfig        = 0x02;
+    ptrOpenCfg->dataPathCfg.cqConfig        = 0x00;
     ptrOpenCfg->dataPathCfg.cq0TransSize    = 132;
     ptrOpenCfg->dataPathCfg.cq1TransSize    = 132;
     ptrOpenCfg->dataPathCfg.cq2TransSize    = 72;

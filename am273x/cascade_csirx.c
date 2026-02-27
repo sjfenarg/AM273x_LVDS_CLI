@@ -51,6 +51,8 @@
 #include <kernel/dpl/AddrTranslateP.h>
 #include <kernel/dpl/SemaphoreP.h>
 #include <kernel/dpl/ClockP.h>
+#include <kernel/dpl/HwiP.h>
+#include <kernel/dpl/CycleCounterP.h>
 #include <ti/utils/test/cascade/am273x_LVDS_CLI/am273x/mssgenerated/ti_drivers_open_close.h>
 
 #include <ti/control/mmwavelink/mmwavelink.h>
@@ -101,6 +103,14 @@ void resetCbuffEOLState(void)
     extern volatile uint32_t gEolCountPort1;
     gEolCountPort0 = 0;
     gEolCountPort1 = 0;
+
+    /* Re-run Fix: Reset the static flags used in the ISRs so the second
+     * run of sensorStart doesn't skip session activation. */
+    extern Bool gFirstTimeFlag_CbuffActivate;
+    gFirstTimeFlag_CbuffActivate = true;
+
+    extern void resetPingPongState(void);
+    resetPingPongState();
 }
 
 void MmwCascade_csirxSetSkipResetWait(Bool enable)
@@ -218,10 +228,17 @@ void MmwCascade_csirxCombinedEOFcallback(CSIRX_Handle handle, void *arg)
 volatile uint32_t gEolCountPort0 = 0;
 volatile uint32_t gEolCountPort1 = 0;
 
+volatile uint32_t gCbuffActivateCycles = 0;
+volatile uint32_t gCbuffTriggerCycles = 0;
+
 #define CBUFF_CONFIG_REG_0  (0x06040000U)
 
 extern void configureTransfer(void);
+extern void skipTransfer(void);
 extern volatile uint32_t gCbuffTriggerCount;
+
+/* Re-run Fix: Must be global so resetCbuffEOLState can reset it */
+Bool gFirstTimeFlag_CbuffActivate = true;
 
 /**
  *  @b Description
@@ -229,36 +246,58 @@ extern volatile uint32_t gCbuffTriggerCount;
  *      Restores the original TI trigger model:
  *        - First EOL: activate CBUFF session
  *        - Subsequent EOLs: configureTransfer + SW trigger
+ *      Includes CBUFF busy guard: skip trigger if previous
+ *      EDMA transfer hasn't completed to prevent FIFO overflow.
  */
 void MmwCascade_combinedEOLcallback(CSIRX_Handle handle, void *arg)
 {
     int32_t errCode = 0;
-    static Bool firstTimeFlag = true;
+    uint32_t t_start;
 
     DebugP_assert(handle != NULL);
 
-    if(firstTimeFlag)
+    if(gFirstTimeFlag_CbuffActivate)
     {
+        t_start = CycleCounterP_getCount32();
         /* Activate CBUFF SW Session on the very first EOL when data is ready */
         if(CBUFF_activateSession(gMmwCascadeMCB.lvdsStreamcfg.lvdsStream.swSessionHandle, &errCode) < 0)
         {
             DebugP_assert(0);
         }
-        firstTimeFlag = false;
+        gCbuffActivateCycles = CycleCounterP_getCount32() - t_start;
+        gFirstTimeFlag_CbuffActivate = false;
+        gCbuffTriggerCount++;
     }
     else
     {
+        /* CBUFF busy guard: skip trigger if previous transfer hasn't completed.
+         * gCbuffTriggerCount > swFrameDoneCount + 1 means CBUFF EDMA is still
+         * in-flight.  Triggering again would overflow the CBUFF FIFO. */
+        if (gCbuffTriggerCount >
+            gMmwCascadeMCB.lvdsStreamcfg.lvdsStream.swFrameDoneCount + 1U)
+        {
+            gCbuffSkipCount++;
+            goto eol_done;
+        }
+
+        t_start = CycleCounterP_getCount32();
         /* Configure SRC Address of EDMA channel for ping/pong switch */
         configureTransfer();
 
         /* Trigger CBUFF SW Session: Frame Start (bit 25) + Chirp Available (bit 24) */
         *((volatile uint32_t *)CBUFF_CONFIG_REG_0) |= 1 << 25;
         *((volatile uint32_t *)CBUFF_CONFIG_REG_0) |= 1 << 24;
+
+        gCbuffTriggerCount++;
+
+        if (gCbuffTriggerCycles == 0) {
+            gCbuffTriggerCycles = CycleCounterP_getCount32() - t_start;
+        }
     }
 
+eol_done:
     gCSIRXState[*((uint32_t*)arg)].callbackCount.combinedEOL++;
     gEolCountPort0++;
-    gCbuffTriggerCount++;
 }
 
 /**

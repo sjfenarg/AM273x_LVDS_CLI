@@ -4,6 +4,8 @@ obj_am273x/cascade_csirx.oer5f: am273x\cascade_csirx.c \
   C:\ti\mmwave_mcuplus_sdk_04_06_01_02\mcu_plus_sdk_am273x_09_02_00_52\source\kernel\dpl\DebugP.h \
   C:\ti\mmwave_mcuplus_sdk_04_06_01_02\mcu_plus_sdk_am273x_09_02_00_52\source\kernel\dpl\SemaphoreP.h \
   C:\ti\mmwave_mcuplus_sdk_04_06_01_02\mcu_plus_sdk_am273x_09_02_00_52\source\kernel\dpl\ClockP.h \
+  C:\ti\mmwave_mcuplus_sdk_04_06_01_02\mcu_plus_sdk_am273x_09_02_00_52\source\kernel\dpl\HwiP.h \
+  C:\ti\mmwave_mcuplus_sdk_04_06_01_02\mcu_plus_sdk_am273x_09_02_00_52\source\kernel\dpl\CycleCounterP.h \
   C:\ti\mmwave_mcuplus_sdk_04_06_01_02\mmwave_mcuplus_sdk_04_06_01_02\ti\utils\test\cascade\am273x_LVDS_CLI\am273x\mssgenerated\ti_drivers_open_close.h \
   C:\ti\mmwave_mcuplus_sdk_04_06_01_02\mmwave_mcuplus_sdk_04_06_01_02\ti\utils\test\cascade\am273x_LVDS_CLI\am273x\mssgenerated\ti_drivers_config.h \
   C:\ti\mmwave_mcuplus_sdk_04_06_01_02\mcu_plus_sdk_am273x_09_02_00_52\source\drivers\hw_include\cslr_soc.h \
@@ -41,7 +43,6 @@ obj_am273x/cascade_csirx.oer5f: am273x\cascade_csirx.c \
   C:\ti\mmwave_mcuplus_sdk_04_06_01_02\mcu_plus_sdk_am273x_09_02_00_52\source\drivers\hw_include\am273x\cslr_top_anareg.h \
   C:\ti\mmwave_mcuplus_sdk_04_06_01_02\mcu_plus_sdk_am273x_09_02_00_52\source\drivers\hw_include\am273x\cslr_efuse_farm.h \
   C:\ti\mmwave_mcuplus_sdk_04_06_01_02\mmwave_mcuplus_sdk_04_06_01_02\ti\utils\test\cascade\am273x_LVDS_CLI\am273x\mssgenerated\ti_dpl_config.h \
-  C:\ti\mmwave_mcuplus_sdk_04_06_01_02\mcu_plus_sdk_am273x_09_02_00_52\source\kernel\dpl\HwiP.h \
   C:\ti\mmwave_mcuplus_sdk_04_06_01_02\mcu_plus_sdk_am273x_09_02_00_52\source\kernel\dpl\CacheP.h \
   C:\ti\mmwave_mcuplus_sdk_04_06_01_02\mcu_plus_sdk_am273x_09_02_00_52\source\kernel\dpl\MpuP_armv7.h \
   C:\ti\mmwave_mcuplus_sdk_04_06_01_02\mcu_plus_sdk_am273x_09_02_00_52\source\drivers\cbuff.h \
@@ -80,7 +81,6 @@ obj_am273x/cascade_csirx.oer5f: am273x\cascade_csirx.c \
   C:\ti\mmwave_mcuplus_sdk_04_06_01_02\mcu_plus_sdk_am273x_09_02_00_52\source\drivers\uart\v1\uart_sci.h \
   C:\ti\mmwave_mcuplus_sdk_04_06_01_02\mcu_plus_sdk_am273x_09_02_00_52\source\drivers\hw_include\cslr_uart.h \
   C:\ti\mmwave_mcuplus_sdk_04_06_01_02\mcu_plus_sdk_am273x_09_02_00_52\source\drivers\uart\v1\cslr_sci.h \
-  C:\ti\mmwave_mcuplus_sdk_04_06_01_02\mcu_plus_sdk_am273x_09_02_00_52\source\kernel\dpl\CycleCounterP.h \
   C:\ti\mmwave_mcuplus_sdk_04_06_01_02\mmwave_mcuplus_sdk_04_06_01_02\ti\control\mmwavelink\mmwavelink.h \
   C:\ti\mmwave_mcuplus_sdk_04_06_01_02\mmwave_mcuplus_sdk_04_06_01_02\ti\control\mmwavelink\include\rl_datatypes.h \
   C:\ti\mmwave_mcuplus_sdk_04_06_01_02\mmwave_mcuplus_sdk_04_06_01_02\ti\control\mmwavelink\include\rl_device.h \

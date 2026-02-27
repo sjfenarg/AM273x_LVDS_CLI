@@ -100,7 +100,7 @@
  * 0: disabled (default, safest)
  * 1: enabled with non-blocking/timeout behavior */
 #ifndef CSIRX_RUNTIME_REARM_MODE
-#define CSIRX_RUNTIME_REARM_MODE   (1U)
+#define CSIRX_RUNTIME_REARM_MODE   (0U)
 #endif
 
 /* Post-start bounded poll for CSIRX reset-done in rearm mode. */
@@ -1260,8 +1260,12 @@ void MmwCascade_mmWaveTest (void)
                         gCSIRXState[1].commonIRQcount.isOCPerror,
                         gCSIRXState[1].commonIRQcount.isFIFOoverflow);
 #endif
+            extern volatile uint32_t gCbuffActivateCycles;
+            extern volatile uint32_t gCbuffTriggerCycles;
             test_print ("  CBUFF (delta): triggers=%u swDone=%u skips=%u\n",
                         deltaTrigger, deltaSwDone, deltaSkips);
+            test_print ("  LATENCY (cycles): Activate=%u Trigger=%u\n",
+                        (unsigned)gCbuffActivateCycles, (unsigned)gCbuffTriggerCycles);
             test_print ("  Bytes: bytesPerTrigger=%u totalBytesSent=%u expectedBytes=%u\n",
                         bytesPerTrigger, totalBytesSent, expectedBytes);
             test_print ("  EOL math: chirpsPerFrame=%u expected=%u fromEOF=%u actual=%u\n",
@@ -1526,9 +1530,7 @@ void resetPingPongState(void)
 
 void configureTransfer(void)
 {
-    static Bool pingPongSwitchFlag = true;
-
-    if(pingPongSwitchFlag)
+    if(gPingPongSwitchFlag)
     {
         /* Update PaRAM set Source address for capturing CSIRX data received on PONG buffer. */
         EDMA_dmaSetPaRAMEntry(CONFIG_EDMA2_BASE_ADDR, CASCADE_LVDS_STREAM_CBUFF_EDMA_CH_0, EDMACC_PARAM_ENTRY_SRC, (uint32_t) SOC_virtToPhy((void *)&CSIA_PongBuf));
@@ -1537,7 +1539,7 @@ void configureTransfer(void)
         EDMA_dmaSetPaRAMEntry(CONFIG_EDMA2_BASE_ADDR, CASCADE_LVDS_STREAM_SW_SESSION_EDMA_CH_0, EDMACC_PARAM_ENTRY_SRC, (uint32_t) SOC_virtToPhy((void *)&CSIB_PongBuf));
         EDMA_dmaSetPaRAMEntry(CONFIG_EDMA2_BASE_ADDR, CASCADE_LVDS_STREAM_SW_SESSION_EDMA_SHADOW_CH_0, EDMACC_PARAM_ENTRY_SRC, (uint32_t) SOC_virtToPhy((void *)&CSIB_PongBuf));
 
-        pingPongSwitchFlag = false;
+        gPingPongSwitchFlag = false;
     }
     else
     {
@@ -1548,7 +1550,7 @@ void configureTransfer(void)
         EDMA_dmaSetPaRAMEntry(CONFIG_EDMA2_BASE_ADDR, CASCADE_LVDS_STREAM_SW_SESSION_EDMA_CH_0, EDMACC_PARAM_ENTRY_SRC, (uint32_t) SOC_virtToPhy((void *)&CSIB_PingBuf));
         EDMA_dmaSetPaRAMEntry(CONFIG_EDMA2_BASE_ADDR, CASCADE_LVDS_STREAM_SW_SESSION_EDMA_SHADOW_CH_0, EDMACC_PARAM_ENTRY_SRC, (uint32_t) SOC_virtToPhy((void *)&CSIB_PingBuf));
 
-        pingPongSwitchFlag = true;
+        gPingPongSwitchFlag = true;
     }
 
     return;
