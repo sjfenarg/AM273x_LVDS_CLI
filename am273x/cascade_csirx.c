@@ -93,6 +93,126 @@ static volatile Bool gCsirxSkipResetWait = false;
 volatile uint32_t gCbuffTriggerCount = 0;
 volatile uint32_t gCbuffSkipCount    = 0;
 
+/* Startup-frame discard: set by ChirpGeom_reset, read by EOL callback */
+volatile uint16_t gStartupDiscardFrames    = 0;
+volatile uint16_t gFirstTransmittedFrameIdx = 0xFFFFU;
+volatile uint32_t gLeakedBadFrames         = 0;
+
+/*
+ * gMasterRfFrameIdx — single source of truth for RF frame progression.
+ *
+ * INVARIANT (required for discard + byte sync):
+ *   - During all EOL callbacks belonging to physical radar frame k,
+ *     gMasterRfFrameIdx MUST equal k (k == 0, 1, 2, ...).
+ *   - On master port (0) EOF, after finalizing frame k into geometry (or
+ *     skipping geometry when over capacity), increment exactly once:
+ *     gMasterRfFrameIdx becomes k + 1 before any EOL of frame k + 1 runs.
+ *
+ * Discard gating, firstTransmittedFrameIdx, and any "current frame" logic
+ * MUST use only this counter — not gGeomCurrentFrameIdx.
+ *
+ * Finite edge case M + N > CHIRP_GEOM_MAX_FRAMES:
+ *   - gMasterRfFrameIdx still advances for every EOF (discard + LVDS stay correct).
+ *   - Per-frame geometry RAM holds at most CHIRP_GEOM_MAX_FRAMES linear slots
+ *     (indices 0 .. cap-1); frames fi >= cap skip the RAM write. Intentional;
+ *     not a regression of capture correctness.
+ */
+volatile uint32_t gMasterRfFrameIdx   = 0;
+volatile Bool     gInfiniteRfCapture = false;
+
+/**************************************************************************
+ ************* Per-Frame Chirp Geometry (indexed by frame number) ***********
+ **************************************************************************/
+PerFrameChirpGeometry_t gChirpGeomByFrame[CHIRP_GEOM_MAX_FRAMES];
+uint16_t                gChirpGeomConfiguredFrames = 0;
+
+static volatile uint16_t gGeomExpectedPerFrame = 64;
+/* Legacy UART / debug alias only: low 16 bits of gMasterRfFrameIdx — do not
+ * use for discard or transmit decisions. */
+static volatile uint16_t gGeomCurrentFrameIdx  = 0;
+static volatile uint16_t gGeomEolInFrame       = 0;
+static volatile uint32_t gGeomFirstEolCycles   = 0;
+static volatile uint32_t gGeomLastEolCycles    = 0;
+
+CsirxObservability_t gCsirxObs[MMWAVE_RADAR_DEVICES];
+
+void ChirpGeom_reset(uint16_t expectedChirpsPerFrame, uint16_t numCaptureFrames,
+                     uint16_t startupDiscard, Bool infiniteRf)
+{
+    memset(gChirpGeomByFrame, 0, sizeof(gChirpGeomByFrame));
+    gInfiniteRfCapture = infiniteRf;
+    if (infiniteRf)
+    {
+        /* Ring buffer over CHIRP_GEOM_MAX_FRAMES; slot = fi % cap */
+        gChirpGeomConfiguredFrames = CHIRP_GEOM_MAX_FRAMES;
+    }
+    else if (numCaptureFrames > CHIRP_GEOM_MAX_FRAMES)
+    {
+        gChirpGeomConfiguredFrames = CHIRP_GEOM_MAX_FRAMES;
+    }
+    else
+    {
+        gChirpGeomConfiguredFrames = numCaptureFrames;
+    }
+    gGeomExpectedPerFrame       = expectedChirpsPerFrame;
+    gMasterRfFrameIdx           = 0;
+    gGeomCurrentFrameIdx        = 0;
+    gGeomEolInFrame             = 0;
+    gGeomFirstEolCycles         = 0;
+    gGeomLastEolCycles          = 0;
+    gStartupDiscardFrames       = startupDiscard;
+    gFirstTransmittedFrameIdx   = 0xFFFFU;
+    gLeakedBadFrames            = 0;
+    memset(gCsirxObs, 0, sizeof(gCsirxObs));
+}
+
+void CsirxObs_pollAndAccumulate(MmwCascade_MCB *CascadeMCB)
+{
+    uint32_t devIdx;
+    for (devIdx = 0; devIdx < MMWAVE_RADAR_DEVICES; devIdx++)
+    {
+        if (CascadeMCB->csiRxHandle[devIdx] == NULL)
+            continue;
+
+        CSIRX_ComplexioLanesIntr lanesIntr;
+        memset(&lanesIntr, 0, sizeof(lanesIntr));
+        if (CSIRX_complexioGetPendingIntr(CascadeMCB->csiRxHandle[devIdx], &lanesIntr) == SystemP_SUCCESS)
+        {
+            uint8_t lane;
+            for (lane = 0; lane < 4; lane++)
+            {
+                if (lanesIntr.dataLane[lane].isStateTransitionToULPM)
+                    gCsirxObs[devIdx].ulpmEnter++;
+                if (lanesIntr.dataLane[lane].isControlError)
+                    gCsirxObs[devIdx].controlError++;
+                if (lanesIntr.dataLane[lane].isEscapeEntryError)
+                    gCsirxObs[devIdx].escapeEntryError++;
+                if (lanesIntr.dataLane[lane].isStartOfTransmissionSyncError)
+                    gCsirxObs[devIdx].sotSyncError++;
+                if (lanesIntr.dataLane[lane].isStartOfTransmissionError)
+                    gCsirxObs[devIdx].sotError++;
+            }
+            CSIRX_complexioClearAllIntr(CascadeMCB->csiRxHandle[devIdx]);
+        }
+
+        CSIRX_ContextIntr ctxIntr;
+        memset(&ctxIntr, 0, sizeof(ctxIntr));
+        if (CSIRX_contextGetPendingIntr(CascadeMCB->csiRxHandle[devIdx], MMW_CASCADE_CSI2_CONTEXT, &ctxIntr) == SystemP_SUCCESS)
+        {
+            if (ctxIntr.isPayloadChecksumMismatch)
+                gCsirxObs[devIdx].payloadChecksumMismatch++;
+            CSIRX_contextClearAllIntr(CascadeMCB->csiRxHandle[devIdx], MMW_CASCADE_CSI2_CONTEXT);
+        }
+
+        uint32_t shortPkt = 0;
+        if (CSIRX_commonGetGenericShortPacket(CascadeMCB->csiRxHandle[devIdx], &shortPkt) == SystemP_SUCCESS)
+        {
+            if (shortPkt != 0)
+                gCsirxObs[devIdx].genericShortPacket++;
+        }
+    }
+}
+
 void resetCbuffEOLState(void)
 {
     gCbuffFirstEOL      = true;
@@ -205,7 +325,61 @@ void MmwCascade_csirxCombinedEOFcallback(CSIRX_Handle handle, void *arg)
 {
     DebugP_assert(handle != NULL);
 
-    gCSIRXState[*((uint32_t*)arg)].callbackCount.combinedEOF++;
+    uint32_t portIdx = *((uint32_t*)arg);
+    gCSIRXState[portIdx].callbackCount.combinedEOF++;
+
+    /* Geometry: master port (0) only.  Slave EOF does not finalize a frame. */
+    if (portIdx == 0U)
+    {
+        uint32_t fi   = gMasterRfFrameIdx;
+        uint16_t cfg  = gChirpGeomConfiguredFrames;
+
+        /* Infinite RF: rolling ring. Finite: linear slot fi while fi < cfg.
+         * When M+N > CHIRP_GEOM_MAX_FRAMES (finite), fi >= cfg skips RAM only;
+         * gMasterRfFrameIdx still advances below — discard/transmit unchanged. */
+        if (gInfiniteRfCapture && cfg > 0U)
+        {
+            uint32_t ring        = fi % (uint32_t)CHIRP_GEOM_MAX_FRAMES;
+            uint32_t eofCyc      = CycleCounterP_getCount32();
+            PerFrameChirpGeometry_t *slot = &gChirpGeomByFrame[ring];
+
+            slot->logicalFrameIdx = fi;
+            slot->frameIdx        = (uint16_t)(fi & 0xFFFFU);
+            slot->expectedCount   = gGeomExpectedPerFrame;
+            slot->observedCount   = gGeomEolInFrame;
+            slot->firstEolCycles  = gGeomFirstEolCycles;
+            slot->lastEolCycles   = gGeomLastEolCycles;
+            slot->eofCycles       = eofCyc;
+            slot->chirpIdSource   = CHIRP_ID_SW_COUNTER;
+            slot->isComplete      = 1U;
+            slot->valid           = GEOM_ENTRY_VALID;
+            slot->reserved        = 0U;
+        }
+        else if (!gInfiniteRfCapture && cfg > 0U && fi < (uint32_t)cfg)
+        {
+            uint32_t eofCyc = CycleCounterP_getCount32();
+            PerFrameChirpGeometry_t *slot = &gChirpGeomByFrame[fi];
+
+            slot->logicalFrameIdx = fi;
+            slot->frameIdx        = (uint16_t)(fi & 0xFFFFU);
+            slot->expectedCount   = gGeomExpectedPerFrame;
+            slot->observedCount   = gGeomEolInFrame;
+            slot->firstEolCycles  = gGeomFirstEolCycles;
+            slot->lastEolCycles   = gGeomLastEolCycles;
+            slot->eofCycles       = eofCyc;
+            slot->chirpIdSource   = CHIRP_ID_SW_COUNTER;
+            slot->isComplete      = 1U;
+            slot->valid           = GEOM_ENTRY_VALID;
+            slot->reserved        = 0U;
+        }
+
+        gMasterRfFrameIdx++;
+        gGeomCurrentFrameIdx = (uint16_t)(gMasterRfFrameIdx & 0xFFFFU);
+
+        gGeomEolInFrame      = 0;
+        gGeomFirstEolCycles  = 0;
+        gGeomLastEolCycles   = 0;
+    }
 }
 
 /**
@@ -256,10 +430,16 @@ void MmwCascade_combinedEOLcallback(CSIRX_Handle handle, void *arg)
 
     DebugP_assert(handle != NULL);
 
+    /* ---- Startup-frame discard gate (per-EOL; index = gMasterRfFrameIdx only) ---- */
+    if (gMasterRfFrameIdx < (uint32_t)gStartupDiscardFrames)
+    {
+        skipTransfer();
+        goto eol_done;
+    }
+
     if(gFirstTimeFlag_CbuffActivate)
     {
         t_start = CycleCounterP_getCount32();
-        /* Activate CBUFF SW Session on the very first EOL when data is ready */
         if(CBUFF_activateSession(gMmwCascadeMCB.lvdsStreamcfg.lvdsStream.swSessionHandle, &errCode) < 0)
         {
             DebugP_assert(0);
@@ -267,12 +447,13 @@ void MmwCascade_combinedEOLcallback(CSIRX_Handle handle, void *arg)
         gCbuffActivateCycles = CycleCounterP_getCount32() - t_start;
         gFirstTimeFlag_CbuffActivate = false;
         gCbuffTriggerCount++;
+
+        if (gFirstTransmittedFrameIdx == 0xFFFFU)
+            gFirstTransmittedFrameIdx = (uint16_t)gMasterRfFrameIdx;
     }
     else
     {
-        /* CBUFF busy guard: skip trigger if previous transfer hasn't completed.
-         * gCbuffTriggerCount > swFrameDoneCount + 1 means CBUFF EDMA is still
-         * in-flight.  Triggering again would overflow the CBUFF FIFO. */
+        /* CBUFF busy guard */
         if (gCbuffTriggerCount >
             gMmwCascadeMCB.lvdsStreamcfg.lvdsStream.swFrameDoneCount + 1U)
         {
@@ -281,10 +462,8 @@ void MmwCascade_combinedEOLcallback(CSIRX_Handle handle, void *arg)
         }
 
         t_start = CycleCounterP_getCount32();
-        /* Configure SRC Address of EDMA channel for ping/pong switch */
         configureTransfer();
 
-        /* Trigger CBUFF SW Session: Frame Start (bit 25) + Chirp Available (bit 24) */
         *((volatile uint32_t *)CBUFF_CONFIG_REG_0) |= 1 << 25;
         *((volatile uint32_t *)CBUFF_CONFIG_REG_0) |= 1 << 24;
 
@@ -296,6 +475,13 @@ void MmwCascade_combinedEOLcallback(CSIRX_Handle handle, void *arg)
     }
 
 eol_done:
+    {
+        uint32_t cyc = CycleCounterP_getCount32();
+        if (gGeomEolInFrame == 0)
+            gGeomFirstEolCycles = cyc;
+        gGeomLastEolCycles = cyc;
+        gGeomEolInFrame++;
+    }
     gCSIRXState[*((uint32_t*)arg)].callbackCount.combinedEOL++;
     gEolCountPort0++;
 }

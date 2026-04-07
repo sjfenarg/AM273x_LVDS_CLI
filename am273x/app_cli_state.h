@@ -48,7 +48,11 @@ typedef struct {
     rlFrameCfg_t frame;
     
     /* profileCfg - full mmWave link profile struct */
-    rlProfileCfg_t profile;   
+    rlProfileCfg_t profile;
+
+    /* Startup-frame discard: skip the first N frames' CBUFF/LVDS triggers
+     * to protect against known-bad startup chirps.  0 = disabled. */
+    uint16_t startupDiscardFrames;
 } CLI_CaptureConfig;
 
 

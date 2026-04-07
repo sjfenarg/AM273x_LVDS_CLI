@@ -211,7 +211,8 @@ CLI_CaptureConfig gCfg = {
         .hpfCornerFreq1        = 0,
         .hpfCornerFreq2        = 0,
         .rxGain                = 42
-    }
+    },
+    .startupDiscardFrames = 0
 };
 
 CLI_CaptureConfig gActive __attribute__((used)) = { 0 };
@@ -396,8 +397,25 @@ static void CLI_handleCommand(char* cmdLine)
                 return;
             }
 
+            /* Finite: startupDiscard must be < user M. Infinite (numFrames==0): no inflate. */
+            if (gCfg.frame.numFrames > 0U)
+            {
+                if (gCfg.startupDiscardFrames >= gCfg.frame.numFrames)
+                {
+                    CLI_uartPrintf("{\"error\":\"startupDiscardFrames (%u) must be < numFrames (%u)\"}\r\n",
+                                   gCfg.startupDiscardFrames, gCfg.frame.numFrames);
+                    return;
+                }
+            }
+
             /* Latch the configured state */
             gActive = gCfg;
+
+            /* Finite only: inflate to M+N internal RF frames. Infinite: leave numFrames 0. */
+            if (gActive.frame.numFrames > 0U && gActive.startupDiscardFrames > 0U)
+            {
+                gActive.frame.numFrames += gActive.startupDiscardFrames;
+            }
             gCliState = CLI_STATE_START_REQUESTED;
 
             /* Calculate derived geometry to print */
@@ -434,11 +452,27 @@ static void CLI_handleCommand(char* cmdLine)
                     bytes_per_chirp, expected_bytes_per_chirp_per_chip);
             }
 
-            CLI_uartPrintf(
-                "{\"status\":\"ok\",\"cmd\":\"sensorStart\",\"frames\":%u}\r\n",
-                (unsigned)gActive.frame.numFrames);
-            DebugP_log("CLI: sensorStart accepted, frames=%u\n",
-                       (unsigned)gActive.frame.numFrames);
+            if (gActive.frame.numFrames > 0U)
+            {
+                CLI_uartPrintf(
+                    "{\"status\":\"ok\",\"cmd\":\"sensorStart\",\"infinite\":0,\"validFrames\":%u,"
+                    "\"startupDiscard\":%u,\"internalFrames\":%u}\r\n",
+                    (unsigned)(gActive.frame.numFrames - gActive.startupDiscardFrames),
+                    (unsigned)gActive.startupDiscardFrames,
+                    (unsigned)gActive.frame.numFrames);
+                DebugP_log("CLI: sensorStart finite valid=%u discard=%u internal=%u\n",
+                           (unsigned)(gActive.frame.numFrames - gActive.startupDiscardFrames),
+                           (unsigned)gActive.startupDiscardFrames,
+                           (unsigned)gActive.frame.numFrames);
+            }
+            else
+            {
+                CLI_uartPrintf(
+                    "{\"status\":\"ok\",\"cmd\":\"sensorStart\",\"infinite\":1,\"startupDiscard\":%u}\r\n",
+                    (unsigned)gActive.startupDiscardFrames);
+                DebugP_log("CLI: sensorStart infinite rf, startupDiscard=%u\n",
+                           (unsigned)gActive.startupDiscardFrames);
+            }
         }
         else
         {
@@ -760,6 +794,32 @@ static void CLI_handleCommand(char* cmdLine)
         return;
     }
 
+    /* ---- setStartupDiscard <N> ---- */
+    if (strcmp(cmdToken, "setStartupDiscard") == 0)
+    {
+        if (gCliState != CLI_STATE_WAITING_FOR_COMMAND)
+        {
+            CLI_uartPrintf("{\"error\":\"busy\",\"state\":\"%s\"}\r\n", CLI_stateName(gCliState));
+            return;
+        }
+        if (argToken == NULL)
+        {
+            CLI_uartWrite("{\"error\":\"requires number of startup frames to discard (0=disabled)\"}\r\n");
+            return;
+        }
+        char* endPtr = NULL;
+        long val = strtol(argToken, &endPtr, 10);
+        if (endPtr == argToken || *endPtr != '\0' || val < 0 || val > 50)
+        {
+            CLI_uartWrite("{\"error\":\"invalid value, range 0..50\"}\r\n");
+            return;
+        }
+        gCfg.startupDiscardFrames = (uint16_t)val;
+        CLI_uartPrintf("{\"status\":\"ok\",\"startupDiscardFrames\":%u}\r\n",
+                       gCfg.startupDiscardFrames);
+        return;
+    }
+
     /* ---- unknown ---- */
     CLI_uartPrintf("{\"error\":\"Unknown command\",\"cmd\":\"%s\"}\r\n",
                    cmdToken);
@@ -853,6 +913,82 @@ extern void Mmwave_ctrlTask(void* args);
 extern void MmwCascade_csirxInit(MmwCascade_MCB  *CascadeMCB);
 extern void MmwCascade_csirxOpen(MmwCascade_MCB  *CascadeMCB, int32_t *errCode);
 static void MmwCascade_CsiConfigTask(void* args);
+
+/**************************************************************************
+ ********** Phase 1F: Config Snapshot + Phase 1B2: Sanity Review **********
+ **************************************************************************/
+static void printConfigSnapshot(void)
+{
+    uint32_t chirpsPerFrame = CLI_getChirpsPerFrame(&gActive);
+    uint32_t bytesPerChirp  = CLI_getBytesPerChirp(&gActive);
+    uint32_t bytesPerSample = (gActive.adcFmt == 1 || gActive.adcFmt == 2) ? 4U : 2U;
+
+    test_print("[CONFIG] chirpsPerFrame=%u samplesPerChirp=%u adcBits=%u adcFmt=%u\n",
+               chirpsPerFrame, gActive.profile.numAdcSamples,
+               gActive.adcBits, gActive.adcFmt);
+    test_print("[CONFIG] rxMask=0x%02X txMask=0x%02X tdm=%u laneCount=4 laneRate=600Mbps\n",
+               gActive.rxMask, gActive.txMask, gActive.tdmEnabled);
+    test_print("[CONFIG] idleTime=%u rampEnd=%u adcStart=%u (10ns units)\n",
+               gActive.profile.idleTimeConst,
+               gActive.profile.rampEndTime,
+               gActive.profile.adcStartTimeConst);
+    test_print("[CONFIG] isPowerAuto=%u isOcpAutoIdle=%u\n",
+               gCsirxComplexioConfig[0].isPowerAuto ? 1U : 0U,
+               gCsirxCommonConfig[0].isOcpAutoIdle ? 1U : 0U);
+    test_print("[CONFIG] stopStateFsmTimeout=%u bytesPerChirp=%u bytesPerSample=%u\n",
+               gCsirxCommonConfig[0].stopStateFsmTimeoutInNanoSecs,
+               bytesPerChirp, bytesPerSample);
+    test_print("[CONFIG] framePeriod=%u frameTrigDelay=%u numFrames=%u\n",
+               gActive.frame.framePeriodicity,
+               gActive.frame.frameTriggerDelay,
+               gActive.frame.numFrames);
+    if (gActive.frame.numFrames > 0U)
+    {
+        uint32_t validReq    = gActive.frame.numFrames - gActive.startupDiscardFrames;
+        uint32_t internalTgt = gActive.frame.numFrames;
+        test_print("[CONFIG] rfMode=finite startupDiscardFrames=%u validFramesRequested=%u internalFramesTarget=%u\n",
+                   gActive.startupDiscardFrames, validReq, internalTgt);
+    }
+    else
+    {
+        test_print("[CONFIG] rfMode=infinite startupDiscardFrames=%u (geom=256-slot ring)\n",
+                   gActive.startupDiscardFrames);
+    }
+    test_print("[CONFIG] chirpIdSource=SW_COUNTER: per-frame EOL count + timing only; "
+               "NOT missing chirp index within a frame (no HW line ID in ADC-only path)\n");
+}
+
+static void printConfigSanityReview(void)
+{
+    uint32_t bytesPerSample = (gActive.adcFmt == 1 || gActive.adcFmt == 2) ? 4U : 2U;
+    uint32_t expectedBytesPerLine = gActive.profile.numAdcSamples * bytesPerSample * TEST_NUM_RX;
+    uint32_t computedBytesPerChirp = CLI_getBytesPerChirp(&gActive);
+
+    test_print("[SANITY] CSIRX0: format=RAW8 VC=%u userDefMap=RAW8 lineOffset=%u ppSwitch=LINE numLinesSw=1\n",
+               gConfigCsirx0ContextConfig[MMW_CASCADE_CSI2_CONTEXT].virtualChannelId,
+               gConfigCsirx0ContextConfig[MMW_CASCADE_CSI2_CONTEXT].pingPongConfig.lineOffset);
+    test_print("[SANITY] CSIRX1: format=RAW8 VC=%u userDefMap=RAW8 lineOffset=%u ppSwitch=LINE numLinesSw=1\n",
+               gConfigCsirx1ContextConfig[MMW_CASCADE_CSI2_CONTEXT].virtualChannelId,
+               gConfigCsirx1ContextConfig[MMW_CASCADE_CSI2_CONTEXT].pingPongConfig.lineOffset);
+    test_print("[SANITY] lanes: pos=1,2,4,5 clk=3 pol=PLUS_MINUS (both ports)\n");
+    test_print("[SANITY] payloadBytesPerLine: expected=%u computed=%u %s\n",
+               expectedBytesPerLine, computedBytesPerChirp,
+               (expectedBytesPerLine == computedBytesPerChirp) ? "OK" : "MISMATCH");
+
+    if (expectedBytesPerLine != computedBytesPerChirp)
+        test_print("[SANITY WARNING] payload size mismatch!\n");
+
+    if (gConfigCsirx0ContextConfig[MMW_CASCADE_CSI2_CONTEXT].virtualChannelId != 0)
+        test_print("[SANITY WARNING] CSIRX0 VC != 0\n");
+    if (gConfigCsirx1ContextConfig[MMW_CASCADE_CSI2_CONTEXT].virtualChannelId != 0)
+        test_print("[SANITY WARNING] CSIRX1 VC != 0\n");
+    if (gConfigCsirx0ContextConfig[MMW_CASCADE_CSI2_CONTEXT].enableIntr.isPayloadChecksumMismatch == false)
+        test_print("[SANITY WARNING] CSIRX0 payload checksum mismatch IRQ disabled - mismatches would be silent\n");
+
+    test_print("[SANITY] cqConfig=0x%02X transferFmtPkt0=0x%02X (ADC_DATA_ONLY expected: 0x01)\n",
+               0x00U, 0x01U);
+    test_print("[SANITY] review complete\n");
+}
 /**************************************************************************
  *********************** mmWave Unit Test Functions ***********************
  **************************************************************************/
@@ -1080,6 +1216,8 @@ void MmwCascade_mmWaveTest (void)
 
     extern void resetCbuffEOLState(void);
     extern void resetPingPongState(void);
+    extern void ChirpGeom_reset(uint16_t expectedChirpsPerFrame, uint16_t numCaptureFrames,
+                                uint16_t startupDiscard, Bool infiniteRf);
     extern void Mmwave_resetAsyncDiagCounters(void);
     extern volatile uint32_t gCbuffTriggerCount;
     extern volatile uint32_t gCbuffSkipCount;
@@ -1122,11 +1260,18 @@ void MmwCascade_mmWaveTest (void)
      * instead. */
     resetCbuffEOLState();
     resetPingPongState();
+    ChirpGeom_reset((uint16_t)CLI_getChirpsPerFrame(&gActive),
+                    (uint16_t)gActive.frame.numFrames,
+                    gActive.startupDiscardFrames,
+                    (Bool)(gActive.frame.numFrames == 0U));
     Mmwave_resetAsyncDiagCounters();
     gChirpHdrFrameIdx      = 0U;
     gChirpHdrChirpIdx      = 0U;
     gChirpHdrGlobalIdx     = 0U;
     gChirpHdrChirpsPerFrame = CLI_getChirpsPerFrame(&gActive);
+
+    printConfigSnapshot();
+    printConfigSanityReview();
 
     /* Capture baselines IMMEDIATELY before MMWave_start so that any
      * pre-existing counter values (from boot-time CSI link training,
@@ -1155,11 +1300,37 @@ void MmwCascade_mmWaveTest (void)
 
     if (gActive.frame.numFrames == 0)
     {
-        test_print ("--- Capture Started (Infinite) ---\n");
-        test_print ("  Baselines: EOF0=%u EOL0=%u\n", baseEOF0, baseEOL0);
-        while(1)
+        test_print ("--- Capture Started (Infinite RF) ---\n");
+        test_print ("  Baselines: EOF0=%u EOL0=%u swDone=%u triggers=%u\n",
+                    baseEOF0, baseEOL0, baseSwDone, baseTrigger);
+        if (gActive.startupDiscardFrames > 0U)
         {
-            vTaskDelay(pdMS_TO_TICKS(100));
+            test_print ("  startupDiscard=%u: first %u RF frames suppressed on LVDS\n",
+                        (unsigned)gActive.startupDiscardFrames,
+                        (unsigned)gActive.startupDiscardFrames);
+        }
+        {
+            uint32_t heartbeatTick = ClockP_getTicks();
+            extern volatile uint32_t gMasterRfFrameIdx;
+            extern volatile uint16_t gFirstTransmittedFrameIdx;
+
+            while (1)
+            {
+                vTaskDelay(pdMS_TO_TICKS(100));
+                uint32_t currentTick = ClockP_getTicks();
+                if (currentTick - heartbeatTick >= (uint32_t)pdMS_TO_TICKS(30000))
+                {
+                    uint32_t triggersRel = gCbuffTriggerCount - baseTrigger;
+                    uint32_t swDoneRel   = gMmwCascadeMCB.lvdsStreamcfg.lvdsStream.swFrameDoneCount - baseSwDone;
+                    uint32_t eofRel0     = gCSIRXState[0].callbackCount.combinedEOF - baseEOF0;
+                    test_print("[HB-INF] masterRfIdx=%u eof=%u trig=%u done=%u firstTxFi=%u discardN=%u\n",
+                               (unsigned)gMasterRfFrameIdx, (unsigned)eofRel0,
+                               (unsigned)triggersRel, (unsigned)swDoneRel,
+                               (unsigned)gFirstTransmittedFrameIdx,
+                               (unsigned)gActive.startupDiscardFrames);
+                    heartbeatTick = currentTick;
+                }
+            }
         }
     }
     else
@@ -1177,34 +1348,30 @@ void MmwCascade_mmWaveTest (void)
 
         uint32_t lastTrigger = 0;
         uint32_t lastSwDone  = 0;
-        uint32_t lastPrintTick = ClockP_getTicks();
+        uint32_t stallCheckTick   = ClockP_getTicks();
+        uint32_t heartbeatTick   = ClockP_getTicks();
         extern volatile uint32_t gEolCountPort0;
-        extern volatile uint32_t gEolCountPort1;
 
         /* ISR-driven capture loop: The EOL ISR in cascade_csirx.c handles
          * CBUFF_activateSession (first EOL), configureTransfer + trigger (subsequent).
-         * This loop only monitors progress and detects stalls. */
+         * This loop only monitors progress and detects stalls.
+         *
+         * Phase 1 "silent" rules:
+         *   - NO per-frame geometry UART during capture (RAM ring only)
+         *   - NO CsirxObs polling during capture (deferred to end)
+         *   - One compact heartbeat line every ~30 s
+         *   - Stall watchdog checks every ~2 s (no UART unless stall) */
         while(gCSIRXState[0].callbackCount.combinedEOF < targetEOF0)
         {
-            ClockP_usleep(10000); /* 10ms sleep — just monitoring, ISR does the work */
+            ClockP_usleep(10000); /* 10ms sleep -- just monitoring, ISR does the work */
 
             uint32_t currentTick  = ClockP_getTicks();
-            uint32_t eofRel0      = gCSIRXState[0].callbackCount.combinedEOF - baseEOF0;
             uint32_t triggersRel  = gCbuffTriggerCount - baseTrigger;
             uint32_t swDoneRel    = gMmwCascadeMCB.lvdsStreamcfg.lvdsStream.swFrameDoneCount - baseSwDone;
 
-            /* Heartbeat (approx every 2s) */
-            if (currentTick - lastPrintTick >= (uint32_t)pdMS_TO_TICKS(2000))
+            /* Stall watchdog (~2 s cadence, no UART unless stall detected) */
+            if (currentTick - stallCheckTick >= (uint32_t)pdMS_TO_TICKS(2000))
             {
-                test_print("[HEARTBEAT] triggers=%u swDone=%u eol0=%u eol1=%u eof0=%u OVF0=%u OVF1=%u\n",
-                           (unsigned)triggersRel, (unsigned)swDoneRel,
-                           (unsigned)(gEolCountPort0 - baseEOL0),
-                           (unsigned)(gEolCountPort1 - baseEOL1),
-                           (unsigned)eofRel0,
-                           (unsigned)gCSIRXState[0].commonIRQcount.isFIFOoverflow,
-                           (unsigned)gCSIRXState[1].commonIRQcount.isFIFOoverflow);
-
-                /* Stall Watchdog: If triggers haven't changed in 2 seconds */
                 if (triggersRel > 0 &&
                     triggersRel == lastTrigger &&
                     swDoneRel   == lastSwDone)
@@ -1214,10 +1381,22 @@ void MmwCascade_mmWaveTest (void)
                     captureEndByWatchdogTimeout = 1U;
                     break;
                 }
-
                 lastTrigger   = triggersRel;
                 lastSwDone    = swDoneRel;
-                lastPrintTick = currentTick;
+                stallCheckTick = currentTick;
+            }
+
+            /* Lightweight heartbeat (~30 s cadence, single line) */
+            if (currentTick - heartbeatTick >= (uint32_t)pdMS_TO_TICKS(30000))
+            {
+                uint32_t eofRel0 = gCSIRXState[0].callbackCount.combinedEOF - baseEOF0;
+                test_print("[HB] eof=%u trig=%u done=%u eol0=%u ovf0=%u ovf1=%u\n",
+                           (unsigned)eofRel0, (unsigned)triggersRel,
+                           (unsigned)swDoneRel,
+                           (unsigned)(gEolCountPort0 - baseEOL0),
+                           (unsigned)gCSIRXState[0].commonIRQcount.isFIFOoverflow,
+                           (unsigned)gCSIRXState[1].commonIRQcount.isFIFOoverflow);
+                heartbeatTick = currentTick;
             }
         }
 
@@ -1244,6 +1423,112 @@ void MmwCascade_mmWaveTest (void)
             uint32_t bytesPerTrigger = CLI_getBytesPerChirp(&gActive) * MMWAVE_RADAR_DEVICES;
             uint32_t totalBytesSent  = deltaTrigger * bytesPerTrigger;
             uint32_t expectedBytes   = expectedEol * bytesPerTrigger;
+
+            /* Collect CSIRX observability once, now that capture is idle */
+            CsirxObs_pollAndAccumulate(&gMmwCascadeMCB);
+
+            /* Per-frame geometry: same valid slots used for summary and [GEOM] dump */
+            {
+                uint32_t fi;
+                uint32_t validCount   = 0U;
+                uint32_t idxMismatch  = 0U;
+                uint32_t steadyOk     = 0U;
+                uint32_t steadyLoss   = 0U;
+                uint32_t totalLoss    = 0U;
+                uint32_t minObs       = 0xFFFFU;
+                uint32_t maxObs       = 0U;
+                uint16_t firstShortFi = 0xFFFFU;
+                uint16_t lastShortFi  = 0U;
+                uint16_t ncfg         = gChirpGeomConfiguredFrames;
+                uint32_t steadyLo     = 25U;
+                uint32_t steadyHi     = (gActive.frame.numFrames > 10U) ?
+                                        (gActive.frame.numFrames - 10U) : gActive.frame.numFrames;
+
+                for (fi = 0U; fi < (uint32_t)ncfg; fi++)
+                {
+                    PerFrameChirpGeometry_t *g = &gChirpGeomByFrame[fi];
+                    if (g->valid != GEOM_ENTRY_VALID)
+                    {
+                        continue;
+                    }
+                    validCount++;
+                    if (g->frameIdx != (uint16_t)fi)
+                    {
+                        idxMismatch++;
+                    }
+                    {
+                        uint8_t isSteady = (g->frameIdx >= steadyLo && g->frameIdx < steadyHi) ? 1U : 0U;
+                        if (isSteady)
+                        {
+                            if (g->observedCount == g->expectedCount)
+                            {
+                                steadyOk++;
+                            }
+                            else
+                            {
+                                steadyLoss++;
+                            }
+                        }
+                    }
+                    if (g->observedCount < g->expectedCount)
+                    {
+                        totalLoss++;
+                        if (firstShortFi == 0xFFFFU)
+                        {
+                            firstShortFi = (uint16_t)fi;
+                        }
+                        lastShortFi = (uint16_t)fi;
+                    }
+                    if (g->observedCount < minObs)
+                    {
+                        minObs = g->observedCount;
+                    }
+                    if (g->observedCount > maxObs)
+                    {
+                        maxObs = g->observedCount;
+                    }
+                }
+
+                if (validCount == 0U)
+                {
+                    minObs = 0U;
+                    maxObs = 0U;
+                }
+
+                test_print("[GEOM-SUMMARY] slots=%u valid=%u idxMismatch=%u steadyOk=%u steadyLoss=%u "
+                           "framesObsLtExp=%u minObs=%u maxObs=%u\n",
+                           (unsigned)ncfg, (unsigned)validCount, (unsigned)idxMismatch,
+                           (unsigned)steadyOk, (unsigned)steadyLoss, (unsigned)totalLoss,
+                           (unsigned)minObs, (unsigned)maxObs);
+                if (totalLoss > 0U)
+                {
+                    test_print("[GEOM-SUMMARY] lossSpan: firstFi=%u lastFi=%u (SW_COUNTER: "
+                               "count-only, not chirp index within frame)\n",
+                               (unsigned)firstShortFi, (unsigned)lastShortFi);
+                }
+                else
+                {
+                    test_print("[GEOM-SUMMARY] lossSpan: none in valid slots (SW_COUNTER: "
+                               "count-only, not chirp index within frame)\n");
+                }
+                test_print("[GEOM-SUMMARY] masterEOF=%u geomCap=%u (max storage %u frames)\n",
+                           (unsigned)deltaEOF0, (unsigned)ncfg, CHIRP_GEOM_MAX_FRAMES);
+
+                for (fi = 0U; fi < (uint32_t)ncfg; fi++)
+                {
+                    PerFrameChirpGeometry_t *g = &gChirpGeomByFrame[fi];
+                    if (g->valid != GEOM_ENTRY_VALID)
+                    {
+                        continue;
+                    }
+                    test_print("[GEOM] slotFi=%u logFi=%u: obs=%u exp=%u eol1cy=%u eolNcy=%u eofcy=%u\n",
+                               (unsigned)g->frameIdx, (unsigned)g->logicalFrameIdx,
+                               (unsigned)g->observedCount,
+                               (unsigned)g->expectedCount,
+                               (unsigned)g->firstEolCycles, (unsigned)g->lastEolCycles,
+                               (unsigned)g->eofCycles);
+                }
+            }
 
             test_print ("--- Capture Finished! ---\n");
             test_print ("  Baselines: EOF0=%u EOL0=%u swDone=%u triggers=%u\n",
@@ -1272,6 +1557,62 @@ void MmwCascade_mmWaveTest (void)
                         chirpsPerFrame, expectedEol, eolFromEof, deltaEOL0);
             test_print ("  End reason: eof_target=%u watchdog_timeout=%u\n",
                         captureEndByEofTarget, captureEndByWatchdogTimeout);
+            test_print ("  [CSIRX-OBS-FINAL] P0: ulpmE=%u sotErr=%u sotSync=%u ctrlErr=%u escErr=%u cksum=%u genSP=%u\n",
+                        gCsirxObs[0].ulpmEnter, gCsirxObs[0].sotError,
+                        gCsirxObs[0].sotSyncError, gCsirxObs[0].controlError,
+                        gCsirxObs[0].escapeEntryError, gCsirxObs[0].payloadChecksumMismatch,
+                        gCsirxObs[0].genericShortPacket);
+#if CONFIG_CSIRX_NUM_INSTANCES > 1
+            test_print ("  [CSIRX-OBS-FINAL] P1: ulpmE=%u sotErr=%u sotSync=%u ctrlErr=%u escErr=%u cksum=%u genSP=%u\n",
+                        gCsirxObs[1].ulpmEnter, gCsirxObs[1].sotError,
+                        gCsirxObs[1].sotSyncError, gCsirxObs[1].controlError,
+                        gCsirxObs[1].escapeEntryError, gCsirxObs[1].payloadChecksumMismatch,
+                        gCsirxObs[1].genericShortPacket);
+#endif
+
+            /* ---- [DISCARD] Startup-frame discard validation ---- */
+            {
+                extern volatile uint16_t gStartupDiscardFrames;
+                extern volatile uint16_t gFirstTransmittedFrameIdx;
+                extern volatile uint32_t gLeakedBadFrames;
+
+                uint16_t discN       = gStartupDiscardFrames;
+                uint32_t validReq    = gActive.frame.numFrames - discN;
+                uint32_t expectedTx  = validReq * chirpsPerFrame;
+                uint32_t expectedByt = expectedTx * bytesPerTrigger;
+
+                test_print("[DISCARD] requestedValid=%u startupDiscard=%u internalTarget=%u\n",
+                           (unsigned)validReq, (unsigned)discN,
+                           (unsigned)gActive.frame.numFrames);
+                test_print("[DISCARD] deltaTriggers=%u deltaSwDone=%u expectedTriggers=%u\n",
+                           (unsigned)deltaTrigger, (unsigned)deltaSwDone,
+                           (unsigned)expectedTx);
+                test_print("[DISCARD] bytesSent=%u expectedBytes=%u\n",
+                           (unsigned)totalBytesSent, (unsigned)expectedByt);
+                test_print("[DISCARD] firstTransmittedFrameIdx=%u (expected=%u)\n",
+                           (unsigned)gFirstTransmittedFrameIdx, (unsigned)discN);
+                test_print("[DISCARD] leakedBadFrames=%u\n",
+                           (unsigned)gLeakedBadFrames);
+
+                if (discN > 0U)
+                {
+                    if (deltaTrigger != expectedTx)
+                        test_print("[DISCARD WARNING] trigger count mismatch: got %u expected %u\n",
+                                   (unsigned)deltaTrigger, (unsigned)expectedTx);
+                    if (deltaSwDone != deltaTrigger)
+                        test_print("[DISCARD WARNING] swDone != triggers: %u vs %u\n",
+                                   (unsigned)deltaSwDone, (unsigned)deltaTrigger);
+                    if (totalBytesSent != expectedByt)
+                        test_print("[DISCARD WARNING] byte count mismatch: %u vs %u\n",
+                                   (unsigned)totalBytesSent, (unsigned)expectedByt);
+                    if (gFirstTransmittedFrameIdx != discN)
+                        test_print("[DISCARD WARNING] firstTxFrame=%u != startupDiscard=%u\n",
+                                   (unsigned)gFirstTransmittedFrameIdx, (unsigned)discN);
+                    if (gLeakedBadFrames != 0U)
+                        test_print("[DISCARD WARNING] leakedBadFrames=%u (should be 0)\n",
+                                   (unsigned)gLeakedBadFrames);
+                }
+            }
         }
 
         /****************************************************************

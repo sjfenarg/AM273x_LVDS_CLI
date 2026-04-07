@@ -160,6 +160,55 @@ typedef struct MmwCascade_MCB_t
 } MmwCascade_MCB;
 
 /**************************************************************************
+ ************* Per-Frame Chirp Geometry (Phase 1 Instrumentation) *********
+ **************************************************************************/
+/*
+ * Phase 1A finding: no real chirp identifier is recoverable from the
+ * AM273x CSIRX receive buffer.  The AWR2243 in ADC_DATA_ONLY mode
+ * (transferFmtPkt0=1, cqConfig=0x00) sends only raw ADC samples in
+ * CSI-2 long packets.  The CSIRX hardware strips packet headers before
+ * writing to ping/pong buffers.  The driver has no getLineNumber API.
+ *
+ * Consequence: chirpIdSource = CHIRP_ID_SW_COUNTER for all tracking.
+ * Phase 1 records per-frame EOL counts and timing only.  It does NOT recover
+ * which chirp indices (1..N) are missing inside a frame—only how many
+ * EOL events were seen before master-port EOF.
+ */
+#define CHIRP_ID_HW          0
+#define CHIRP_ID_SW_COUNTER  1
+
+/* One slot per frame index for the configured capture (capped here). */
+#define CHIRP_GEOM_MAX_FRAMES  256
+
+#define GEOM_ENTRY_EMPTY   0U
+#define GEOM_ENTRY_VALID   1U
+
+typedef struct {
+    uint16_t frameIdx;        /* low 16 bits of logicalFrameIdx (legacy / UART) */
+    uint16_t expectedCount;
+    uint16_t observedCount;
+    uint32_t firstEolCycles;
+    uint32_t lastEolCycles;
+    uint32_t eofCycles;
+    uint8_t  valid;           /* GEOM_ENTRY_VALID after EOF finalizes this slot */
+    uint8_t  isComplete;      /* 1 when valid */
+    uint8_t  chirpIdSource;   /* always CHIRP_ID_SW_COUNTER in Phase 1 */
+    uint8_t  reserved;
+    uint32_t logicalFrameIdx; /* full RF frame index (ring mode: may exceed 255) */
+} PerFrameChirpGeometry_t;
+
+typedef struct {
+    uint32_t ulpmEnter;
+    uint32_t ulpmExit;
+    uint32_t sotError;
+    uint32_t sotSyncError;
+    uint32_t controlError;
+    uint32_t escapeEntryError;
+    uint32_t genericShortPacket;
+    uint32_t payloadChecksumMismatch;
+} CsirxObservability_t;
+
+/**************************************************************************
  *************************** Extern Definitions ***************************
  **************************************************************************/
 extern void mmwCascade_csirxSOF0callback(CSIRX_Handle handle, uint32_t arg, uint8_t contextId);
@@ -167,5 +216,22 @@ extern void mmwCascade_csirxSOF0callback(CSIRX_Handle handle, uint32_t arg, uint
 extern void MmwCascade_csirxClose(MmwCascade_MCB  *CascadeMCB);
 extern void MmwCascade_CSIConfig(MmwCascade_MCB  *CascadeMCB);
 extern void MmwCascade_csirxSetSkipResetWait(Bool enable);
+
+extern PerFrameChirpGeometry_t gChirpGeomByFrame[CHIRP_GEOM_MAX_FRAMES];
+extern uint16_t                gChirpGeomConfiguredFrames;
+extern CsirxObservability_t    gCsirxObs[MMWAVE_RADAR_DEVICES];
+
+extern volatile uint16_t gStartupDiscardFrames;
+extern volatile uint16_t gFirstTransmittedFrameIdx;
+extern volatile uint32_t gLeakedBadFrames;
+
+/* Master RF frame index: single source of truth for discard and "current frame".
+ * See invariant comment in cascade_csirx.c next to definition. */
+extern volatile uint32_t gMasterRfFrameIdx;
+extern volatile Bool     gInfiniteRfCapture;
+
+extern void ChirpGeom_reset(uint16_t expectedChirpsPerFrame, uint16_t numCaptureFrames,
+                            uint16_t startupDiscard, Bool infiniteRf);
+extern void CsirxObs_pollAndAccumulate(MmwCascade_MCB *CascadeMCB);
 
 #endif /* MMW_CASCADE_CSIRX_H */
