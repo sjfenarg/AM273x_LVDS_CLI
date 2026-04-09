@@ -1309,28 +1309,9 @@ void MmwCascade_mmWaveTest (void)
                         (unsigned)gActive.startupDiscardFrames,
                         (unsigned)gActive.startupDiscardFrames);
         }
+        while (1)
         {
-            uint32_t heartbeatTick = ClockP_getTicks();
-            extern volatile uint32_t gMasterRfFrameIdx;
-            extern volatile uint16_t gFirstTransmittedFrameIdx;
-
-            while (1)
-            {
-                vTaskDelay(pdMS_TO_TICKS(100));
-                uint32_t currentTick = ClockP_getTicks();
-                if (currentTick - heartbeatTick >= (uint32_t)pdMS_TO_TICKS(30000))
-                {
-                    uint32_t triggersRel = gCbuffTriggerCount - baseTrigger;
-                    uint32_t swDoneRel   = gMmwCascadeMCB.lvdsStreamcfg.lvdsStream.swFrameDoneCount - baseSwDone;
-                    uint32_t eofRel0     = gCSIRXState[0].callbackCount.combinedEOF - baseEOF0;
-                    test_print("[HB-INF] masterRfIdx=%u eof=%u trig=%u done=%u firstTxFi=%u discardN=%u\n",
-                               (unsigned)gMasterRfFrameIdx, (unsigned)eofRel0,
-                               (unsigned)triggersRel, (unsigned)swDoneRel,
-                               (unsigned)gFirstTransmittedFrameIdx,
-                               (unsigned)gActive.startupDiscardFrames);
-                    heartbeatTick = currentTick;
-                }
-            }
+            vTaskDelay(pdMS_TO_TICKS(100));
         }
     }
     else
@@ -1349,8 +1330,6 @@ void MmwCascade_mmWaveTest (void)
         uint32_t lastTrigger = 0;
         uint32_t lastSwDone  = 0;
         uint32_t stallCheckTick   = ClockP_getTicks();
-        uint32_t heartbeatTick   = ClockP_getTicks();
-        extern volatile uint32_t gEolCountPort0;
 
         /* ISR-driven capture loop: The EOL ISR in cascade_csirx.c handles
          * CBUFF_activateSession (first EOL), configureTransfer + trigger (subsequent).
@@ -1359,7 +1338,6 @@ void MmwCascade_mmWaveTest (void)
          * Phase 1 "silent" rules:
          *   - NO per-frame geometry UART during capture (RAM ring only)
          *   - NO CsirxObs polling during capture (deferred to end)
-         *   - One compact heartbeat line every ~30 s
          *   - Stall watchdog checks every ~2 s (no UART unless stall) */
         while(gCSIRXState[0].callbackCount.combinedEOF < targetEOF0)
         {
@@ -1384,19 +1362,6 @@ void MmwCascade_mmWaveTest (void)
                 lastTrigger   = triggersRel;
                 lastSwDone    = swDoneRel;
                 stallCheckTick = currentTick;
-            }
-
-            /* Lightweight heartbeat (~30 s cadence, single line) */
-            if (currentTick - heartbeatTick >= (uint32_t)pdMS_TO_TICKS(30000))
-            {
-                uint32_t eofRel0 = gCSIRXState[0].callbackCount.combinedEOF - baseEOF0;
-                test_print("[HB] eof=%u trig=%u done=%u eol0=%u ovf0=%u ovf1=%u\n",
-                           (unsigned)eofRel0, (unsigned)triggersRel,
-                           (unsigned)swDoneRel,
-                           (unsigned)(gEolCountPort0 - baseEOL0),
-                           (unsigned)gCSIRXState[0].commonIRQcount.isFIFOoverflow,
-                           (unsigned)gCSIRXState[1].commonIRQcount.isFIFOoverflow);
-                heartbeatTick = currentTick;
             }
         }
 

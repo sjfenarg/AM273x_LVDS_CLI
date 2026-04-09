@@ -124,7 +124,7 @@ After a normal completion, logs include port deltas, CBUFF trigger vs `swFrameDo
 
 ### 6.2 Continuous capture
 
-There is no natural end-of-run summary. A periodic **`[HB-INF]`** line (default cadence on the order of tens of seconds) reports master RF index, EOF progress, triggers, completions, first transmit frame index, and configured discard count.
+There is no natural end-of-run summary and no periodic UART heartbeat during capture; the monitor task sleeps in a loop until an external stop path is used (no `[HB]` / `[HB-INF]` lines).
 
 ---
 
