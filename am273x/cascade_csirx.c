@@ -95,8 +95,19 @@ volatile uint32_t gCbuffSkipCount    = 0;
 
 /* Startup-frame discard: set by ChirpGeom_reset, read by EOL callback */
 volatile uint16_t gStartupDiscardFrames    = 0;
+volatile uint16_t gStartupSyncFrames       = 0;
 volatile uint16_t gFirstTransmittedFrameIdx = 0xFFFFU;
 volatile uint32_t gLeakedBadFrames         = 0;
+typedef enum MmwCascade_StartupStreamState_e
+{
+    MMWCASCADE_STARTUP_DISCARD = 0,
+    MMWCASCADE_STARTUP_SYNC,
+    MMWCASCADE_STARTUP_STREAMING
+} MmwCascade_StartupStreamState;
+static volatile MmwCascade_StartupStreamState gStartupStreamState =
+    MMWCASCADE_STARTUP_STREAMING;
+static volatile uint32_t gStartupSyncObservedLines   = 0;
+static volatile uint32_t gStartupSyncSlaveAheadLines = 0;
 
 /*
  * gMasterRfFrameIdx — single source of truth for RF frame progression.
@@ -136,6 +147,26 @@ static volatile uint32_t gGeomLastEolCycles    = 0;
 
 CsirxObservability_t gCsirxObs[MMWAVE_RADAR_DEVICES];
 
+static void MmwCascade_beginStartupSyncFrame(void)
+{
+    gStartupStreamState         = MMWCASCADE_STARTUP_SYNC;
+    gStartupSyncObservedLines   = 0U;
+    gStartupSyncSlaveAheadLines = 0U;
+}
+
+static void MmwCascade_lockStartupSyncAlign(void)
+{
+    Bool invert = false;
+
+    if (gStartupSyncObservedLines > 0U)
+    {
+        invert = (Bool)(gStartupSyncSlaveAheadLines >
+                        (gStartupSyncObservedLines / 2U));
+    }
+
+    CascadeLvds_SetSlavePingPongAlign(invert);
+}
+
 void ChirpGeom_reset(uint16_t expectedChirpsPerFrame, uint16_t numCaptureFrames,
                      uint16_t startupDiscard, Bool infiniteRf)
 {
@@ -161,8 +192,23 @@ void ChirpGeom_reset(uint16_t expectedChirpsPerFrame, uint16_t numCaptureFrames,
     gGeomFirstEolCycles         = 0;
     gGeomLastEolCycles          = 0;
     gStartupDiscardFrames       = startupDiscard;
+    gStartupSyncFrames          = (MMWAVE_RADAR_DEVICES > 1U) ? 1U : 0U;
     gFirstTransmittedFrameIdx   = 0xFFFFU;
     gLeakedBadFrames            = 0;
+    gStartupSyncObservedLines   = 0U;
+    gStartupSyncSlaveAheadLines = 0U;
+    if (startupDiscard > 0U)
+    {
+        gStartupStreamState = MMWCASCADE_STARTUP_DISCARD;
+    }
+    else if (gStartupSyncFrames > 0U)
+    {
+        gStartupStreamState = MMWCASCADE_STARTUP_SYNC;
+    }
+    else
+    {
+        gStartupStreamState = MMWCASCADE_STARTUP_STREAMING;
+    }
     memset(gCsirxObs, 0, sizeof(gCsirxObs));
 }
 
@@ -231,6 +277,7 @@ void resetCbuffEOLState(void)
 
     extern void resetPingPongState(void);
     resetPingPongState();
+    CascadeLvds_ResetSlavePingPongAlign();
 }
 
 void MmwCascade_csirxSetSkipResetWait(Bool enable)
@@ -333,6 +380,8 @@ void MmwCascade_csirxCombinedEOFcallback(CSIRX_Handle handle, void *arg)
     {
         uint32_t fi   = gMasterRfFrameIdx;
         uint16_t cfg  = gChirpGeomConfiguredFrames;
+        Bool finishedSyncFrame =
+            (Bool)(gStartupStreamState == MMWCASCADE_STARTUP_SYNC);
 
         /* Infinite RF: rolling ring. Finite: linear slot fi while fi < cfg.
          * When M+N > CHIRP_GEOM_MAX_FRAMES (finite), fi >= cfg skips RAM only;
@@ -379,6 +428,26 @@ void MmwCascade_csirxCombinedEOFcallback(CSIRX_Handle handle, void *arg)
         gGeomEolInFrame      = 0;
         gGeomFirstEolCycles  = 0;
         gGeomLastEolCycles   = 0;
+
+        if (finishedSyncFrame)
+        {
+            MmwCascade_lockStartupSyncAlign();
+            gStartupStreamState = MMWCASCADE_STARTUP_STREAMING;
+        }
+        else if (gStartupStreamState == MMWCASCADE_STARTUP_DISCARD)
+        {
+            if (gMasterRfFrameIdx >= (uint32_t)gStartupDiscardFrames)
+            {
+                if (gStartupSyncFrames > 0U)
+                {
+                    MmwCascade_beginStartupSyncFrame();
+                }
+                else
+                {
+                    gStartupStreamState = MMWCASCADE_STARTUP_STREAMING;
+                }
+            }
+        }
     }
 }
 
@@ -430,15 +499,30 @@ void MmwCascade_combinedEOLcallback(CSIRX_Handle handle, void *arg)
 
     DebugP_assert(handle != NULL);
 
-    /* ---- Startup-frame discard gate (per-EOL; index = gMasterRfFrameIdx only) ---- */
-    if (gMasterRfFrameIdx < (uint32_t)gStartupDiscardFrames)
+    /* ---- Startup gating: discard first, then one non-transmitted sync frame ---- */
+    if (gStartupStreamState != MMWCASCADE_STARTUP_STREAMING)
     {
+        if (gStartupStreamState == MMWCASCADE_STARTUP_SYNC)
+        {
+            uint32_t slaveCount = gEolCountPort1;
+            if ((slaveCount == gEolCountPort0) ||
+                (slaveCount == (gEolCountPort0 + 1U)))
+            {
+                gStartupSyncObservedLines++;
+                if (slaveCount != gEolCountPort0)
+                {
+                    gStartupSyncSlaveAheadLines++;
+                }
+            }
+        }
         skipTransfer();
         goto eol_done;
     }
 
     if(gFirstTimeFlag_CbuffActivate)
     {
+        CascadeLvds_ApplyFirstTransmitDmaSrc();
+
         t_start = CycleCounterP_getCount32();
         if(CBUFF_activateSession(gMmwCascadeMCB.lvdsStreamcfg.lvdsStream.swSessionHandle, &errCode) < 0)
         {

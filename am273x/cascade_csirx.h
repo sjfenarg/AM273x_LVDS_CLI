@@ -234,4 +234,11 @@ extern void ChirpGeom_reset(uint16_t expectedChirpsPerFrame, uint16_t numCapture
                             uint16_t startupDiscard, Bool infiniteRf);
 extern void CsirxObs_pollAndAccumulate(MmwCascade_MCB *CascadeMCB);
 
+/* LVDS/CBUFF: per-port ping-pong DMA sources (see main_mss.c). */
+extern void CascadeLvds_ApplyCbuffDmaSrcFromSwitchFlag(void);
+extern void CascadeLvds_ApplyFirstTransmitDmaSrc(void);
+extern void CascadeLvds_SetSlavePingPongAlign(Bool invert);
+extern void CascadeLvds_LatchSlavePingPongAlignOnce(uint32_t eol0BeforeLine, uint32_t eol1BeforeLine);
+extern void CascadeLvds_ResetSlavePingPongAlign(void);
+
 #endif /* MMW_CASCADE_CSIRX_H */

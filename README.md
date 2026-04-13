@@ -60,8 +60,8 @@ flowchart LR
 On each CSI-2 line completion, the master **combined EOL** callback runs:
 
 1. **Startup protection (if enabled):** While the current RF frame index is inside the configured discard window, the firmware advances ping–pong tracking only (`skipTransfer`) and **does not** activate CBUFF, reconfigure EDMA sources for transmit, or assert CBUFF software trigger bits. No LVDS payload is emitted for those lines.
-2. **First transmitted line:** `CBUFF_activateSession` (session arm).
-3. **Subsequent lines:** `configureTransfer` (ping/pong source select) and CBUFF register triggers for chirp/frame advance, subject to the existing busy guard when enabled.
+2. **First transmitted line:** EDMA SRC is programmed for **per-port** ping/pong (master stays Ping like session create; slave may select Pong if port-1 EOL parity differs from port 0 at first transmit), then `CBUFF_activateSession` (session arm).
+3. **Subsequent lines:** `configureTransfer` (ping/pong source select for both ports, with the same slave phase offset latched at first transmit) and CBUFF register triggers for chirp/frame advance, subject to the existing busy guard when enabled.
 
 **End of frame (EOF)** on the master port finalizes per-frame geometry (when configured), then advances the **master RF frame index** exactly once. That index drives both discard exit and consistency with host byte counting.
 

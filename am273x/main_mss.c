@@ -308,6 +308,16 @@ static uint32_t CLI_getChirpsPerFrame(const CLI_CaptureConfig* cfg)
     return nTdmChirps * cfg->frame.numLoops;
 }
 
+static uint16_t CLI_getStartupSyncFrames(void)
+{
+    return (MMWAVE_RADAR_DEVICES > 1U) ? 1U : 0U;
+}
+
+static uint16_t CLI_getStartupSuppressedFrames(const CLI_CaptureConfig* cfg)
+{
+    return (uint16_t)(cfg->startupDiscardFrames + CLI_getStartupSyncFrames());
+}
+
 uint32_t CLI_getBytesPerChirp(const CLI_CaptureConfig* cfg)
 {
     /* frame.numAdcSamples is in "half-words" (16-bit units) as per rlFrameCfg_t spec:
@@ -411,10 +421,10 @@ static void CLI_handleCommand(char* cmdLine)
             /* Latch the configured state */
             gActive = gCfg;
 
-            /* Finite only: inflate to M+N internal RF frames. Infinite: leave numFrames 0. */
-            if (gActive.frame.numFrames > 0U && gActive.startupDiscardFrames > 0U)
+            /* Finite only: inflate to M + discard + one sync frame. Infinite: leave 0. */
+            if (gActive.frame.numFrames > 0U)
             {
-                gActive.frame.numFrames += gActive.startupDiscardFrames;
+                gActive.frame.numFrames += CLI_getStartupSuppressedFrames(&gActive);
             }
             gCliState = CLI_STATE_START_REQUESTED;
 
@@ -454,14 +464,15 @@ static void CLI_handleCommand(char* cmdLine)
 
             if (gActive.frame.numFrames > 0U)
             {
+                uint16_t suppressedFrames = CLI_getStartupSuppressedFrames(&gActive);
                 CLI_uartPrintf(
                     "{\"status\":\"ok\",\"cmd\":\"sensorStart\",\"infinite\":0,\"validFrames\":%u,"
                     "\"startupDiscard\":%u,\"internalFrames\":%u}\r\n",
-                    (unsigned)(gActive.frame.numFrames - gActive.startupDiscardFrames),
+                    (unsigned)(gActive.frame.numFrames - suppressedFrames),
                     (unsigned)gActive.startupDiscardFrames,
                     (unsigned)gActive.frame.numFrames);
                 DebugP_log("CLI: sensorStart finite valid=%u discard=%u internal=%u\n",
-                           (unsigned)(gActive.frame.numFrames - gActive.startupDiscardFrames),
+                           (unsigned)(gActive.frame.numFrames - suppressedFrames),
                            (unsigned)gActive.startupDiscardFrames,
                            (unsigned)gActive.frame.numFrames);
             }
@@ -501,9 +512,9 @@ static void CLI_handleCommand(char* cmdLine)
         char* endPtr = NULL;
         long val = strtol(argToken, &endPtr, 10);
         if ((endPtr == argToken) || (*endPtr != '\0') ||
-            (val < 1) || (val > 65535))
+            (val < 0) || (val > 65535))
         {
-            CLI_uartWrite("{\"error\":\"invalid or out-of-range value [1..65535]\"}\r\n");
+            CLI_uartWrite("{\"error\":\"invalid or out-of-range value [0..65535]; 0 selects continuous RF\"}\r\n");
             return;
         }
 
@@ -628,9 +639,9 @@ static void CLI_handleCommand(char* cmdLine)
             return;
         }
 
-        if (args[0] > args[1] || args[2] == 0 || args[3] == 0)
+        if (args[0] > args[1] || args[2] == 0)
         {
-            CLI_uartWrite("{\"error\":\"invalid frame bounds or zero loops/frames\"}\r\n");
+            CLI_uartWrite("{\"error\":\"invalid frame bounds or zero loops (frames may be 0 for continuous RF)\"}\r\n");
             return;
         }
 
@@ -944,7 +955,7 @@ static void printConfigSnapshot(void)
                gActive.frame.numFrames);
     if (gActive.frame.numFrames > 0U)
     {
-        uint32_t validReq    = gActive.frame.numFrames - gActive.startupDiscardFrames;
+        uint32_t validReq    = gActive.frame.numFrames - CLI_getStartupSuppressedFrames(&gActive);
         uint32_t internalTgt = gActive.frame.numFrames;
         test_print("[CONFIG] rfMode=finite startupDiscardFrames=%u validFramesRequested=%u internalFramesTarget=%u\n",
                    gActive.startupDiscardFrames, validReq, internalTgt);
@@ -1542,7 +1553,8 @@ void MmwCascade_mmWaveTest (void)
                 extern volatile uint32_t gLeakedBadFrames;
 
                 uint16_t discN       = gStartupDiscardFrames;
-                uint32_t validReq    = gActive.frame.numFrames - discN;
+                uint16_t suppressedN = CLI_getStartupSuppressedFrames(&gActive);
+                uint32_t validReq    = gActive.frame.numFrames - suppressedN;
                 uint32_t expectedTx  = validReq * chirpsPerFrame;
                 uint32_t expectedByt = expectedTx * bytesPerTrigger;
 
@@ -1555,11 +1567,11 @@ void MmwCascade_mmWaveTest (void)
                 test_print("[DISCARD] bytesSent=%u expectedBytes=%u\n",
                            (unsigned)totalBytesSent, (unsigned)expectedByt);
                 test_print("[DISCARD] firstTransmittedFrameIdx=%u (expected=%u)\n",
-                           (unsigned)gFirstTransmittedFrameIdx, (unsigned)discN);
+                           (unsigned)gFirstTransmittedFrameIdx, (unsigned)suppressedN);
                 test_print("[DISCARD] leakedBadFrames=%u\n",
                            (unsigned)gLeakedBadFrames);
 
-                if (discN > 0U)
+                if (suppressedN > 0U)
                 {
                     if (deltaTrigger != expectedTx)
                         test_print("[DISCARD WARNING] trigger count mismatch: got %u expected %u\n",
@@ -1570,9 +1582,9 @@ void MmwCascade_mmWaveTest (void)
                     if (totalBytesSent != expectedByt)
                         test_print("[DISCARD WARNING] byte count mismatch: %u vs %u\n",
                                    (unsigned)totalBytesSent, (unsigned)expectedByt);
-                    if (gFirstTransmittedFrameIdx != discN)
-                        test_print("[DISCARD WARNING] firstTxFrame=%u != startupDiscard=%u\n",
-                                   (unsigned)gFirstTransmittedFrameIdx, (unsigned)discN);
+                    if (gFirstTransmittedFrameIdx != suppressedN)
+                        test_print("[DISCARD WARNING] firstTxFrame=%u != suppressedFrames=%u\n",
+                                   (unsigned)gFirstTransmittedFrameIdx, (unsigned)suppressedN);
                     if (gLeakedBadFrames != 0U)
                         test_print("[DISCARD WARNING] leakedBadFrames=%u (should be 0)\n",
                                    (unsigned)gLeakedBadFrames);
@@ -1808,6 +1820,60 @@ static void MmwCascade_initTask(void* args)
  * Reset before MMWave_start to stay in sync with gCbuffFirstEOL. */
 volatile Bool gPingPongSwitchFlag = true;
 
+/* When true, slave (CSIB) DMA SRC uses opposite ping/pong half vs master for this chirp.
+ * Latched once at first LVDS line after startup discard from port0/port1 EOL parity. */
+static volatile Bool gSlavePingPongInvert        = false;
+static volatile Bool gSlavePingPongInvertLatched = false;
+
+static void CascadeLvds_SetCbuffDmaSrc(Bool usePingMaster, Bool usePingSlave)
+{
+    uint32_t srcA = (uint32_t) SOC_virtToPhy((void *)(usePingMaster ? &CSIA_PingBuf : &CSIA_PongBuf));
+    uint32_t srcB = (uint32_t) SOC_virtToPhy((void *)(usePingSlave ? &CSIB_PingBuf : &CSIB_PongBuf));
+
+    EDMA_dmaSetPaRAMEntry(CONFIG_EDMA2_BASE_ADDR, CASCADE_LVDS_STREAM_CBUFF_EDMA_CH_0, EDMACC_PARAM_ENTRY_SRC, srcA);
+    EDMA_dmaSetPaRAMEntry(CONFIG_EDMA2_BASE_ADDR, CASCADE_LVDS_STREAM_CBUFF_EDMA_SHADOW_CH_0, EDMACC_PARAM_ENTRY_SRC, srcA);
+    EDMA_dmaSetPaRAMEntry(CONFIG_EDMA2_BASE_ADDR, CASCADE_LVDS_STREAM_SW_SESSION_EDMA_CH_0, EDMACC_PARAM_ENTRY_SRC, srcB);
+    EDMA_dmaSetPaRAMEntry(CONFIG_EDMA2_BASE_ADDR, CASCADE_LVDS_STREAM_SW_SESSION_EDMA_SHADOW_CH_0, EDMACC_PARAM_ENTRY_SRC, srcB);
+}
+
+void CascadeLvds_ApplyCbuffDmaSrcFromSwitchFlag(void)
+{
+    /* Same mapping as legacy configureTransfer: flag true -> Pong, false -> Ping. */
+    Bool usePingMaster = (Bool)(!gPingPongSwitchFlag);
+    Bool usePingSlave  = (Bool)(usePingMaster != gSlavePingPongInvert);
+    CascadeLvds_SetCbuffDmaSrc(usePingMaster, usePingSlave);
+}
+
+void CascadeLvds_ApplyFirstTransmitDmaSrc(void)
+{
+    /* Use the startup-adjusted phase after any skipped chirps, but do not toggle the
+     * switch flag here. The next configureTransfer() will advance to the following chirp. */
+    Bool usePingMaster = gPingPongSwitchFlag;
+    Bool usePingSlave  = (Bool)(usePingMaster != gSlavePingPongInvert);
+    CascadeLvds_SetCbuffDmaSrc(usePingMaster, usePingSlave);
+}
+
+void CascadeLvds_SetSlavePingPongAlign(Bool invert)
+{
+    gSlavePingPongInvert        = invert;
+    gSlavePingPongInvertLatched = true;
+}
+
+void CascadeLvds_LatchSlavePingPongAlignOnce(uint32_t eol0BeforeLine, uint32_t eol1BeforeLine)
+{
+    if (!gSlavePingPongInvertLatched)
+    {
+        gSlavePingPongInvert = (Bool)((eol0BeforeLine & 1U) != (eol1BeforeLine & 1U));
+        gSlavePingPongInvertLatched = true;
+    }
+}
+
+void CascadeLvds_ResetSlavePingPongAlign(void)
+{
+    gSlavePingPongInvert        = false;
+    gSlavePingPongInvertLatched = false;
+}
+
 static void populateChirpHeader(void)
 {
     ChirpHeader_t *hdr = gPingPongSwitchFlag ? &gChirpHdrPing : &gChirpHdrPong;
@@ -1836,29 +1902,8 @@ void resetPingPongState(void)
 
 void configureTransfer(void)
 {
-    if(gPingPongSwitchFlag)
-    {
-        /* Update PaRAM set Source address for capturing CSIRX data received on PONG buffer. */
-        EDMA_dmaSetPaRAMEntry(CONFIG_EDMA2_BASE_ADDR, CASCADE_LVDS_STREAM_CBUFF_EDMA_CH_0, EDMACC_PARAM_ENTRY_SRC, (uint32_t) SOC_virtToPhy((void *)&CSIA_PongBuf));
-        EDMA_dmaSetPaRAMEntry(CONFIG_EDMA2_BASE_ADDR, CASCADE_LVDS_STREAM_CBUFF_EDMA_SHADOW_CH_0, EDMACC_PARAM_ENTRY_SRC, (uint32_t) SOC_virtToPhy((void *)&CSIA_PongBuf));
-
-        EDMA_dmaSetPaRAMEntry(CONFIG_EDMA2_BASE_ADDR, CASCADE_LVDS_STREAM_SW_SESSION_EDMA_CH_0, EDMACC_PARAM_ENTRY_SRC, (uint32_t) SOC_virtToPhy((void *)&CSIB_PongBuf));
-        EDMA_dmaSetPaRAMEntry(CONFIG_EDMA2_BASE_ADDR, CASCADE_LVDS_STREAM_SW_SESSION_EDMA_SHADOW_CH_0, EDMACC_PARAM_ENTRY_SRC, (uint32_t) SOC_virtToPhy((void *)&CSIB_PongBuf));
-
-        gPingPongSwitchFlag = false;
-    }
-    else
-    {
-        /* Update PaRAM set Source address for capturing CSIRX data received on PING buffer. */
-        EDMA_dmaSetPaRAMEntry(CONFIG_EDMA2_BASE_ADDR, CASCADE_LVDS_STREAM_CBUFF_EDMA_CH_0, EDMACC_PARAM_ENTRY_SRC, (uint32_t) SOC_virtToPhy((void *)&CSIA_PingBuf));
-        EDMA_dmaSetPaRAMEntry(CONFIG_EDMA2_BASE_ADDR, CASCADE_LVDS_STREAM_CBUFF_EDMA_SHADOW_CH_0, EDMACC_PARAM_ENTRY_SRC, (uint32_t) SOC_virtToPhy((void *)&CSIA_PingBuf));
-
-        EDMA_dmaSetPaRAMEntry(CONFIG_EDMA2_BASE_ADDR, CASCADE_LVDS_STREAM_SW_SESSION_EDMA_CH_0, EDMACC_PARAM_ENTRY_SRC, (uint32_t) SOC_virtToPhy((void *)&CSIB_PingBuf));
-        EDMA_dmaSetPaRAMEntry(CONFIG_EDMA2_BASE_ADDR, CASCADE_LVDS_STREAM_SW_SESSION_EDMA_SHADOW_CH_0, EDMACC_PARAM_ENTRY_SRC, (uint32_t) SOC_virtToPhy((void *)&CSIB_PingBuf));
-
-        gPingPongSwitchFlag = true;
-    }
-
+    CascadeLvds_ApplyCbuffDmaSrcFromSwitchFlag();
+    gPingPongSwitchFlag = (Bool)(!gPingPongSwitchFlag);
     return;
 }
 
