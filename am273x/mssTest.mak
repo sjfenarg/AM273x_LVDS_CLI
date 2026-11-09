@@ -7,6 +7,7 @@
 # Setup the VPATH:
 ###################################################################################
 vpath %.c $(MMWAVE_SDK_DEVICE_TYPE)
+vpath %.c $(MMWAVE_SDK_DEVICE_TYPE)/mmwave_ctrl
 
 MSS_CPU := R5F
 
@@ -21,12 +22,12 @@ MSS_CPU := R5F
 ###################################################################################
 CASCADE_MSS_UNIT_TEST_STD_LIBS = $($(MSS_CPU)_COMMON_STD_LIB) \
 								-llibtestlogger_$(MMWAVE_SDK_DEVICE_TYPE).$($(MSS_CPU)_LIB_EXT) \
-								-llibmmwavelink_cascade_$(MMWAVE_SDK_DEVICE_TYPE).$($(MSS_CPU)_LIB_EXT) \
-								-llibmmwave_cascade_$(MMWAVE_SDK_DEVICE_TYPE).$($(MSS_CPU)_LIB_EXT)
+								-llibmmwavelink_cascade_$(MMWAVE_SDK_DEVICE_TYPE).$($(MSS_CPU)_LIB_EXT)
+# NOTE: libmmwave_cascade is NOT linked. The mmWave control sources are vendored
+# (patched) in am273x/mmwave_ctrl and compiled below; see mmwave_ctrl/PATCHES.md.
 CASCADE_MSS_UNIT_TEST_LOC_LIBS = $($(MSS_CPU)_COMMON_LOC_LIB) \
 								-Wl,-i$(MMWAVE_SDK_INSTALL_PATH)/ti/utils/testlogger/lib \
-								-Wl,-i$(MMWAVE_SDK_INSTALL_PATH)/ti/control/mmwavelink/lib \
-								-Wl,-i$(MMWAVE_SDK_INSTALL_PATH)/ti/control/mmwave/lib
+								-Wl,-i$(MMWAVE_SDK_INSTALL_PATH)/ti/control/mmwavelink/lib
 
 
 ###################################################################################
@@ -40,7 +41,13 @@ CASCADE_MSS_UNIT_TEST_APP_CMD	 = $(MMWAVE_SDK_DEVICE_TYPE)/mss_linker.cmd
 CASCADE_MSS_UNIT_TEST_SOURCES	 = main_mss.c \
 								   common.c \
 								   cascade_lvds_stream.c \
-								   cascade_csirx.c
+								   cascade_csirx.c \
+								   mmwave.c \
+								   mmwave_link_common.c \
+								   mmwave_osal.c \
+								   mmwave_fullcfg.c \
+								   mmwave_listlib.c \
+								   mmwave_link_spi_22xx.c
 
 CASCADE_MSS_UNIT_TEST_SOURCES_GEN = ti_board_config.c	\
 									ti_board_open_close.c	\

@@ -993,15 +993,22 @@ void Mmwave_populateDefaultCalibrationCfg (MMWave_CalibrationCfg* ptrCalibration
  *  @retval
  *      Not Applicable.
  */
+extern volatile Bool gMmwCtrlStopRequested;
+extern volatile Bool gMmwCtrlStopped;
+
 void Mmwave_ctrlTask(void* args)
 {
     int32_t errCode;
 
-    while (1)
+    while (gMmwCtrlStopRequested == false)
     {
         /* Execute the mmWave control module: */
         if (MMWave_execute (gMmwCascadeMCB.mmWaveHandle, &errCode) < 0)
             test_print ("Error: mmWave control execution failed [Error code %d]\n", errCode);
     }
+    /* All SPI calls from the last execute have returned. The init task can now
+     * delete this suspended task before destructing mmWave/driver objects. */
+    gMmwCtrlStopped = true;
+    vTaskSuspend(NULL);
 }
 

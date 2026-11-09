@@ -130,6 +130,8 @@ static volatile uint32_t gStartupSyncSlaveAheadLines = 0;
  */
 volatile uint32_t gMasterRfFrameIdx   = 0;
 volatile Bool     gInfiniteRfCapture = false;
+/* Keep the physical finite target separate from the capped geometry storage. */
+static volatile uint32_t gFiniteRfFrameTarget = 0U;
 
 /**************************************************************************
  ************* Per-Frame Chirp Geometry (indexed by frame number) ***********
@@ -172,6 +174,7 @@ void ChirpGeom_reset(uint16_t expectedChirpsPerFrame, uint16_t numCaptureFrames,
 {
     memset(gChirpGeomByFrame, 0, sizeof(gChirpGeomByFrame));
     gInfiniteRfCapture = infiniteRf;
+    gFiniteRfFrameTarget = infiniteRf ? 0U : numCaptureFrames;
     if (infiniteRf)
     {
         /* Ring buffer over CHIRP_GEOM_MAX_FRAMES; slot = fi % cap */
@@ -498,6 +501,15 @@ void MmwCascade_combinedEOLcallback(CSIRX_Handle handle, void *arg)
     uint32_t t_start;
 
     DebugP_assert(handle != NULL);
+
+    /* A pending EOL can run after the final EOF interrupt. Keep counting it
+     * for diagnostics, but never append a chirp beyond the finite RF target. */
+    if ((!gInfiniteRfCapture) && (gFiniteRfFrameTarget != 0U) &&
+        (gMasterRfFrameIdx >= gFiniteRfFrameTarget))
+    {
+        skipTransfer();
+        goto eol_done;
+    }
 
     /* ---- Startup gating: discard first, then one non-transmitted sync frame ---- */
     if (gStartupStreamState != MMWCASCADE_STARTUP_STREAMING)

@@ -74,6 +74,22 @@
 #include <ti/utils/testlogger/logger.h>
 #include <ti/utils/test/cascade/am273x_LVDS_CLI/am273x/cascade_csirx.h>
 #include <ti/utils/test/cascade/am273x_LVDS_CLI/am273x/chirp_header.h>
+#include <ti/utils/test/cascade/am273x_LVDS_CLI/am273x/mmwave_ctrl/mmwave_ctrl_patch.h>
+
+/* Shared with cascade_csirx.c / common.c (used by the front-end start supervisor) */
+extern volatile Bool     gCbuffFirstEOL;
+extern volatile uint32_t gAsyncFaultCount;
+extern volatile uint32_t gCbuffTriggerCount;
+extern volatile uint32_t gCbuffSkipCount;
+
+/* Front-end start supervisor state (defined near MmwCascade_mmWaveTest) */
+extern volatile uint32_t gFeStartMaxAttempts;
+extern volatile uint32_t gFeStartAttempt;
+extern volatile uint32_t gFeStartRetryCount;
+extern volatile uint32_t gFeTestInjectFailures;
+extern volatile int32_t  gFeLastError;
+extern volatile int32_t  gFeLastMmWaveError;
+extern volatile int32_t  gFeLastSubsysError;
 
 /**************************************************************************
  ******************************** MACROS  *********************************
@@ -120,6 +136,8 @@ TaskHandle_t    gCsiConfigTask;
 StaticTask_t    gCsiConfigTaskObj;
 
 TaskHandle_t    gMmwCtrlTask;
+volatile Bool   gMmwCtrlStopRequested = false;
+volatile Bool   gMmwCtrlStopped = false;
 StaticTask_t    gMmwCtrlTaskObj;
 
 StackType_t gAppTskStackMain[APP_TASK_STACK_SIZE] __attribute__((aligned(32)));
@@ -230,7 +248,7 @@ uint32_t          gChirpHdrChirpsPerFrame = 64U;
 /* CLI task handle — stored globally so initTask can delete it before teardown */
 static TaskHandle_t        gCliTaskHandle = NULL;
 static StaticTask_t        gCliTaskObj;
-static StackType_t         gCliTaskStack[4096U / sizeof(StackType_t)];
+static StackType_t         gCliTaskStack[8192U / sizeof(StackType_t)];
 #define CLI_TASK_PRI       (4U)   /* Below APP_TASK_PRI so it doesn't starve init */
 #define CLI_CMD_BUF_SIZE   (128U) /* profileCfg with 14 args can exceed 64 bytes */
 
@@ -260,9 +278,10 @@ static void CLI_uartWrite(const char* msg)
 static void CLI_uartPrintf(const char* fmt, ...)
 {
     /* Stack-local buffer avoids reentrancy issues if multiple tasks ever
-     * call this function.  512 bytes fits comfortably on the CLI task's
-     * 4 KiB stack (only ~12.5% usage). */
-    char fmtBuf[512];
+     * call this function (CLI task and the init task's front-end reports).
+     * 1 KiB holds the extended status / fault-report lines; the CLI task
+     * stack is 8 KiB. */
+    char fmtBuf[1024];
     va_list ap;
     va_start(ap, fmt);
     vsnprintf(fmtBuf, sizeof(fmtBuf), fmt, ap);
@@ -384,13 +403,23 @@ static void CLI_handleCommand(char* cmdLine)
             "\"frame\":{\"start\":%u,\"end\":%u,\"loops\":%u,\"frames\":%u,\"period\":%u,\"trig\":%u,\"delay\":%u}},"
             "\"derived\":{\"ntx_active\":%u,\"nrx_active\":%u,\"n_tdm_chirps\":%u,"
             "\"chirps_per_frame\":%u,\"logical_sweeps_per_frame\":%u,\"bytes_per_frame\":%u,\"total_sweeps\":%u},"
+            "\"fe\":{\"startAttempt\":%u,\"maxAttempts\":%u,\"retries\":%u,\"startGapUs\":%u,"
+            "\"cpuFaults\":[%u,%u],\"invalidAsync\":%u,"
+            "\"lastError\":%d,\"mmWaveError\":%d,\"subsysError\":%d,"
+            "\"irqKicks\":%u,\"linkTimeouts\":%u},"
             "\"err\":0}\r\n",
             CLI_stateName(gCliState),
             gCfg.tdmEnabled, gCfg.rxMask, gCfg.txMask,
             gCfg.frame.chirpStartIdx, gCfg.frame.chirpEndIdx, gCfg.frame.numLoops, gCfg.frame.numFrames,
             gCfg.frame.framePeriodicity, gCfg.frame.triggerSelect, gCfg.frame.frameTriggerDelay,
             ntx, nrx, n_tdm_chirps,
-            chirps_per_frame, logical_sweeps, bytes_per_frame, (logical_sweeps * gCfg.frame.numFrames)
+            chirps_per_frame, logical_sweeps, bytes_per_frame, (logical_sweeps * gCfg.frame.numFrames),
+            (unsigned)gFeStartAttempt, (unsigned)gFeStartMaxAttempts, (unsigned)gFeStartRetryCount,
+            (unsigned)gMMWavePatchSlaveStartGapUs,
+            (unsigned)gMMWavePatchFeFault[0].totalCount, (unsigned)gMMWavePatchFeFault[1].totalCount,
+            (unsigned)gMMWavePatchInvalidAsyncMsgCount,
+            (int)gFeLastError, (int)gFeLastMmWaveError, (int)gFeLastSubsysError,
+            (unsigned)gMMWavePatchIrqKickCount, (unsigned)gMMWavePatchLinkSyncTimeoutCount
         );
         return;
     }
@@ -831,6 +860,76 @@ static void CLI_handleCommand(char* cmdLine)
         return;
     }
 
+    /* ---- setStartGap <us> : delay between slave and master rlSensorStart ---- */
+    if (strcmp(cmdToken, "setStartGap") == 0)
+    {
+        if (gCliState != CLI_STATE_WAITING_FOR_COMMAND)
+        {
+            CLI_uartPrintf("{\"error\":\"busy\",\"state\":\"%s\"}\r\n", CLI_stateName(gCliState));
+            return;
+        }
+        if (argToken == NULL)
+        {
+            CLI_uartWrite("{\"error\":\"requires slave->master start gap in microseconds\"}\r\n");
+            return;
+        }
+        char* endPtr = NULL;
+        long val = strtol(argToken, &endPtr, 10);
+        if (endPtr == argToken || *endPtr != '\0' || val < 0 || val > 1000000)
+        {
+            CLI_uartWrite("{\"error\":\"invalid value, range 0..1000000 us\"}\r\n");
+            return;
+        }
+        gMMWavePatchSlaveStartGapUs = (uint32_t)val;
+        CLI_uartPrintf("{\"status\":\"ok\",\"startGapUs\":%u}\r\n", (unsigned)gMMWavePatchSlaveStartGapUs);
+        return;
+    }
+
+    /* ---- setStartRetries <n> : front-end start attempts before giving up ---- */
+    if (strcmp(cmdToken, "setStartRetries") == 0)
+    {
+        if (gCliState != CLI_STATE_WAITING_FOR_COMMAND)
+        {
+            CLI_uartPrintf("{\"error\":\"busy\",\"state\":\"%s\"}\r\n", CLI_stateName(gCliState));
+            return;
+        }
+        if (argToken == NULL)
+        {
+            CLI_uartWrite("{\"error\":\"requires number of start attempts (1..20)\"}\r\n");
+            return;
+        }
+        char* endPtr = NULL;
+        long val = strtol(argToken, &endPtr, 10);
+        if (endPtr == argToken || *endPtr != '\0' || val < 1 || val > 20)
+        {
+            CLI_uartWrite("{\"error\":\"invalid value, range 1..20\"}\r\n");
+            return;
+        }
+        gFeStartMaxAttempts = (uint32_t)val;
+        CLI_uartPrintf("{\"status\":\"ok\",\"startAttempts\":%u}\r\n", (unsigned)gFeStartMaxAttempts);
+        return;
+    }
+
+    /* ---- setFeTestFailures <n> : TEST HOOK, fail the first n healthy starts ---- */
+    if (strcmp(cmdToken, "setFeTestFailures") == 0)
+    {
+        if (gCliState != CLI_STATE_WAITING_FOR_COMMAND)
+        {
+            CLI_uartPrintf("{\"error\":\"busy\",\"state\":\"%s\"}\r\n", CLI_stateName(gCliState));
+            return;
+        }
+        char* endPtr = NULL;
+        long val = (argToken != NULL) ? strtol(argToken, &endPtr, 10) : -1;
+        if ((argToken == NULL) || (endPtr == argToken) || (*endPtr != '\0') || (val < 0) || (val > 10))
+        {
+            CLI_uartWrite("{\"error\":\"requires number of injected start failures (0..10)\"}\r\n");
+            return;
+        }
+        gFeTestInjectFailures = (uint32_t)val;
+        CLI_uartPrintf("{\"status\":\"ok\",\"feTestFailures\":%u}\r\n", (unsigned)gFeTestInjectFailures);
+        return;
+    }
+
     /* ---- unknown ---- */
     CLI_uartPrintf("{\"error\":\"Unknown command\",\"cmd\":\"%s\"}\r\n",
                    cmdToken);
@@ -1096,6 +1195,190 @@ void Enable_BUCK4_ViaPMIC(void)
  *  @retval
  *      Not Applicable.
  */
+/**************************************************************************
+ * Front-end start supervision (CHIRP fix)
+ *
+ * The slave AWR2243 intermittently reports an MSS CPU fault (faultType 4,
+ * "MSS Processor Chirp Errors") at the first HW-triggered frame. TI's mmWave
+ * control code asserted on it and froze the MCU, so LVDS never started and the
+ * DCA1000 received nothing. The vendored control library (mmwave_ctrl/) now
+ * records the fault instead; here we verify that BOTH CSI-2 ports deliver
+ * frames after MMWave_start, and if not, tear the mmWave stack down (which
+ * resets the AWR2243s through nRESET) and bring it up again.
+ **************************************************************************/
+volatile uint32_t gFeStartMaxAttempts   = 5U;   /* CLI: setStartRetries */
+volatile uint32_t gFeStartAttempt       = 0U;   /* attempt that is running / succeeded */
+volatile uint32_t gFeStartRetryCount    = 0U;   /* failed attempts since boot */
+volatile uint32_t gFeRunFaultReported[MMWAVE_RADAR_DEVICES];
+volatile uint32_t gFeTestInjectFailures = 0U;  /* CLI: setFeTestFailures (test hook, default 0) */
+volatile int32_t  gFeLastError          = 0;   /* encoded error from the last failed attempt */
+volatile int32_t  gFeLastMmWaveError    = 0;
+volatile int32_t  gFeLastSubsysError    = 0;
+
+/* Frames each CSI-2 port must complete before the start is declared healthy. */
+#define FE_HEALTH_FRAMES            (2U)
+#define FE_HEALTH_EXTRA_MS          (2000U)
+#define FE_TEARDOWN_SETTLE_MS       (50U)
+
+static uint32_t MmwCascade_framePeriodMs(void)
+{
+    /* framePeriodicity is in 5 ns units */
+    uint32_t ms = gActive.frame.framePeriodicity / 200000U;
+    return (ms == 0U) ? 1U : ms;
+}
+
+/* Count every failed bring-up stage, including init/open/config failures.
+ * Decode the signed 14-bit mmWaveLink code explicitly: TI's decoder in this
+ * SDK exposes negative link errors as unsigned 14-bit values (e.g. -8 as 16376). */
+static void MmwCascade_feRecordFailure(int32_t errCode)
+{
+    uint32_t raw = (uint32_t)errCode;
+    int32_t mmWave = (int32_t)((raw >> 16U) & 0xFFFFU);
+    int32_t subsys = (int32_t)((raw >> 2U) & 0x3FFFU);
+
+    if ((mmWave & 0x8000) != 0) { mmWave -= 0x10000; }
+    if ((subsys & 0x2000) != 0) { subsys -= 0x4000; }
+    gFeLastError       = errCode;
+    gFeLastMmWaveError = mmWave;
+    gFeLastSubsysError = subsys;
+    gFeStartRetryCount++;
+}
+
+static void MmwCascade_feReport(const char* evt, uint32_t attempt, const char* reason)
+{
+    const volatile uint32_t* p0 = gMMWavePatchFeFault[0].payload;
+    const volatile uint32_t* p1 = gMMWavePatchFeFault[1].payload;
+    CLI_uartPrintf(
+        "{\"event\":\"%s\",\"attempt\":%u,\"maxAttempts\":%u,\"reason\":\"%s\","
+        "\"eof\":[%u,%u],\"eol\":[%u,%u],"
+        "\"feCpuFaults\":[%u,%u],\"rfFaults\":%u,"
+        "\"fault0\":[\"0x%08X\",\"0x%08X\",\"0x%08X\"],"
+        "\"fault1\":[\"0x%08X\",\"0x%08X\",\"0x%08X\"],"
+        "\"startGapUs\":%u,\"lastError\":%d,\"mmWaveError\":%d,\"subsysError\":%d,"
+        "\"irqKicks\":%u,\"linkTimeouts\":%u}\r\n",
+        evt, (unsigned)attempt, (unsigned)gFeStartMaxAttempts, reason,
+        (unsigned)gCSIRXState[0].callbackCount.combinedEOF,
+        (unsigned)gCSIRXState[1].callbackCount.combinedEOF,
+        (unsigned)gCSIRXState[0].callbackCount.combinedEOL,
+        (unsigned)gCSIRXState[1].callbackCount.combinedEOL,
+        (unsigned)gMMWavePatchFeFault[0].count, (unsigned)gMMWavePatchFeFault[1].count,
+        (unsigned)gAsyncFaultCount,
+        (unsigned)p0[0], (unsigned)p0[1], (unsigned)p0[2],
+        (unsigned)p1[0], (unsigned)p1[1], (unsigned)p1[2],
+        (unsigned)gMMWavePatchSlaveStartGapUs,
+        (int)gFeLastError, (int)gFeLastMmWaveError, (int)gFeLastSubsysError,
+        (unsigned)gMMWavePatchIrqKickCount, (unsigned)gMMWavePatchLinkSyncTimeoutCount);
+}
+
+/* Returns NULL when both CSI-2 ports completed FE_HEALTH_FRAMES frames with no
+ * front-end fault, otherwise a short reason string. */
+static const char* MmwCascade_waitRfHealthy(uint32_t baseEof0, uint32_t baseEof1)
+{
+    /* A finite one-frame capture cannot produce the usual two health frames. */
+    uint32_t healthFrames = FE_HEALTH_FRAMES;
+    if ((gActive.frame.numFrames != 0U) && (gActive.frame.numFrames < healthFrames))
+    {
+        healthFrames = gActive.frame.numFrames;
+    }
+    uint32_t timeoutMs = (gActive.frame.frameTriggerDelay / 200000U) +
+                         ((healthFrames + 2U) * MmwCascade_framePeriodMs()) +
+                         FE_HEALTH_EXTRA_MS;
+    uint32_t elapsedMs = 0U;
+
+    while (elapsedMs < timeoutMs)
+    {
+        uint32_t eof0 = gCSIRXState[0].callbackCount.combinedEOF - baseEof0;
+        uint32_t eof1 = gCSIRXState[1].callbackCount.combinedEOF - baseEof1;
+
+        if (gMMWavePatchFeFault[1].count != 0U) { return "slave_mss_cpu_fault"; }
+        if (gMMWavePatchFeFault[0].count != 0U) { return "master_mss_cpu_fault"; }
+        if (gAsyncFaultCount != 0U)             { return "rf_fault_event"; }
+        if ((eof0 >= healthFrames) && (eof1 >= healthFrames))
+        {
+            /* Test hook: force the recovery path on otherwise healthy starts. */
+            if (gFeTestInjectFailures > 0U)
+            {
+                gFeTestInjectFailures--;
+                return "injected_test_failure";
+            }
+            return NULL;
+        }
+        ClockP_usleep(10U * 1000U);
+        elapsedMs += 10U;
+    }
+
+    if ((gCSIRXState[0].callbackCount.combinedEOF == baseEof0) &&
+        (gCSIRXState[1].callbackCount.combinedEOF == baseEof1))
+    {
+        return "no_csi_frames_both";
+    }
+    if (gCSIRXState[1].callbackCount.combinedEOF - baseEof1 < healthFrames)
+    {
+        return "no_csi_frames_slave";
+    }
+    return "no_csi_frames_master";
+}
+
+/* Let an active SPI exchange finish before deleting its owning task. A task
+ * blocked in MIBSPI_transfer owns a stack-local transaction until it returns. */
+static Bool MmwCascade_stopControlTask(void)
+{
+    uint32_t waitedMs = 0U;
+    if (gMmwCtrlTask == NULL) { return true; }
+
+    MMWavePatch_disableSpiGpio();
+    gMmwCtrlStopRequested = true;
+    MMWavePatch_wakeControlTask();
+    while ((gMmwCtrlStopped == false) && (waitedMs < MMWAVE_PATCH_LINK_SYNC_TIMEOUT_MS))
+    {
+        ClockP_usleep(1000U);
+        waitedMs++;
+    }
+    if (gMmwCtrlStopped == false)
+    {
+        MmwCascade_feReport("fe_teardown_failed", gFeStartAttempt, "control_task_stop_timeout");
+        return false;
+    }
+    vTaskDelete(gMmwCtrlTask);
+    gMmwCtrlTask = NULL;
+    return true;
+}
+
+/* Bring the mmWave stack (and both AWR2243s) fully down so MMWave_init can run again. */
+static Bool MmwCascade_feTeardown(void)
+{
+    int32_t err = 0;
+
+    if (gMmwCascadeMCB.mmWaveHandle != NULL)
+    {
+        /* stop/close still need the mmWave ctrl task to service link responses;
+         * errors are expected when a front end has faulted and are ignored. */
+        (void)MMWave_stop (gMmwCascadeMCB.mmWaveHandle, &err);
+        (void)MMWave_close(gMmwCascadeMCB.mmWaveHandle, &err);
+    }
+
+    /* MMWave_init() memsets the control block (including the semaphore the ctrl
+     * task pends on), so the ctrl task must be gone before deinit/init. */
+    if (MmwCascade_stopControlTask() == false) { return false; }
+
+    if (gMmwCascadeMCB.mmWaveHandle != NULL)
+    {
+        /* Holds the AWR2243s in reset (nRESET low); MMWave_open releases reset. */
+        (void)MMWave_deinit(gMmwCascadeMCB.mmWaveHandle, &err);
+        gMmwCascadeMCB.mmWaveHandle = NULL;
+    }
+
+    /* If a failed attempt got as far as activating the CBUFF session, release it. */
+    if ((gCbuffFirstEOL == false) &&
+        (gMmwCascadeMCB.lvdsStreamcfg.lvdsStream.swSessionHandle != NULL))
+    {
+        (void)CBUFF_deactivateSession(gMmwCascadeMCB.lvdsStreamcfg.lvdsStream.swSessionHandle, &err);
+    }
+
+    ClockP_usleep(FE_TEARDOWN_SETTLE_MS * 1000U);
+    return true;
+}
+
 void MmwCascade_mmWaveTest (void)
 {
     MMWave_InitCfg          initCfg;
@@ -1108,6 +1391,28 @@ void MmwCascade_mmWaveTest (void)
     int16_t                 mmWaveErrorCode;
     int16_t                 subsysErrorCode;
     uint32_t                u32DevIdx;
+    uint32_t                baseEOF0 = 0U;
+    uint32_t                baseEOL0 = 0U;
+#if CONFIG_CSIRX_NUM_INSTANCES > 1
+    uint32_t                baseEOF1 = 0U;
+    uint32_t                baseEOL1 = 0U;
+#endif
+    uint32_t                baseTrigger = 0U;
+    uint32_t                baseSwDone  = 0U;
+    uint32_t                baseSkips   = 0U;
+    uint32_t                feAttempt;
+    Bool                    feStarted = false;
+    const char*             feReason  = NULL;
+
+    memset((void *)gFeRunFaultReported, 0, sizeof(gFeRunFaultReported));
+
+    /* CHIRP fix: bring-up + start is retried until both CSI-2 ports deliver
+     * frames with no front-end fault (see MmwCascade_waitRfHealthy). The loop
+     * body keeps the original TI indentation to keep the diff readable. */
+    for (feAttempt = 1U; (feAttempt <= gFeStartMaxAttempts) && (feStarted == false); feAttempt++)
+    {
+    gFeStartAttempt = feAttempt;
+    MMWavePatch_clearFeFaults();
 
     /* Initialize the configuration: */
     memset ((void *)&initCfg, 0, sizeof(MMWave_InitCfg));
@@ -1133,7 +1438,11 @@ void MmwCascade_mmWaveTest (void)
 
         /* Log into the MCPI Test Logger: */
         MCPI_setFeatureTestResult ("MMWave MSS Initialization", MCPI_TestResult_FAIL);
-        return;
+        feReason = "mmwave_init_failed";
+        MmwCascade_feRecordFailure(errCode);
+        MmwCascade_feReport("fe_start_retry", feAttempt, feReason);
+        if (MmwCascade_feTeardown() == false) { return; }
+        continue;
     }
     
     test_print ("MMWave MSS Initialization\n");
@@ -1144,6 +1453,8 @@ void MmwCascade_mmWaveTest (void)
      *   mmWave control API
      *****************************************************************************/
     /* Launch the CSIRX Task */
+    gMmwCtrlStopRequested = false;
+    gMmwCtrlStopped = false;
     gMmwCtrlTask = xTaskCreateStatic( Mmwave_ctrlTask,   /* Pointer to the function that implements the task. */
                                 "test_mmw_ctrl_task", /* Text name for the task.  This is to facilitate debugging only. */
                                 MMW_CTRL_TASK_STACK_SIZE,  /* Stack depth in units of StackType_t typically uint32_t on 32b CPUs */
@@ -1203,7 +1514,11 @@ void MmwCascade_mmWaveTest (void)
         /* Error: Unable to configure the mmWave control module */
         test_print ("Error: mmWave open failed [Error code %d]\n", errCode);
         MCPI_setFeatureTestResult ("MMWave MSS Open", MCPI_TestResult_FAIL);
-        return;
+        feReason = "mmwave_open_failed";
+        MmwCascade_feRecordFailure(errCode);
+        MmwCascade_feReport("fe_start_retry", feAttempt, feReason);
+        if (MmwCascade_feTeardown() == false) { return; }
+        continue;
     }
    
     test_print ("MMWave MSS Open done.\n");
@@ -1216,7 +1531,11 @@ void MmwCascade_mmWaveTest (void)
         /* Error: Unable to configure the mmWave control module */
         test_print ("Error: mmWave configuration failed [Error code %d]\n", errCode);
         MCPI_setFeatureTestResult ("MMWave MSS Configuration", MCPI_TestResult_FAIL);
-        return;
+        feReason = "mmwave_config_failed";
+        MmwCascade_feRecordFailure(errCode);
+        MmwCascade_feReport("fe_start_retry", feAttempt, feReason);
+        if (MmwCascade_feTeardown() == false) { return; }
+        continue;
     }
     
     test_print ("MMWave MSS Configuration done\n");
@@ -1244,10 +1563,12 @@ void MmwCascade_mmWaveTest (void)
     extern volatile uint8_t  gAsyncLastDev;
     extern void MmwCascade_csirxSetSkipResetWait(Bool enable);
 
-#if CSIRX_RUNTIME_REARM_MODE
+    /* CHIRP fix: on a retry the AWR2243s were reset mid-frame, which can leave the
+     * CSIRX contexts mid-frame; re-arm CSIRX before starting again. */
+    if ((CSIRX_RUNTIME_REARM_MODE != 0U) || (feAttempt > 1U))
     {
         int32_t csirxRearmErr = 0;
-        test_print("CSIRX runtime rearm: enabled (non-blocking mode)\n");
+        test_print("CSIRX runtime rearm: enabled (non-blocking mode, attempt %u)\n", (unsigned)feAttempt);
         MmwCascade_csirxClose(&gMmwCascadeMCB);
         MmwCascade_csirxOpen(&gMmwCascadeMCB, &csirxRearmErr);
         if (csirxRearmErr == 0)
@@ -1261,7 +1582,6 @@ void MmwCascade_mmWaveTest (void)
             test_print("Warning: CSIRX runtime rearm open failed [%d], continuing\n", csirxRearmErr);
         }
     }
-#endif
 
     /* Reset CBUFF/EDMA activation state (needed for session activation on
      * first EOL) and async diagnostic counters.
@@ -1287,15 +1607,16 @@ void MmwCascade_mmWaveTest (void)
     /* Capture baselines IMMEDIATELY before MMWave_start so that any
      * pre-existing counter values (from boot-time CSI link training,
      * idle-period spurious events, etc.) are accounted for. */
-    uint32_t baseEOF0  = gCSIRXState[0].callbackCount.combinedEOF;
-    uint32_t baseEOL0  = gCSIRXState[0].callbackCount.combinedEOL;
+    baseEOF0  = gCSIRXState[0].callbackCount.combinedEOF;
+    baseEOL0  = gCSIRXState[0].callbackCount.combinedEOL;
 #if CONFIG_CSIRX_NUM_INSTANCES > 1
-    uint32_t baseEOF1  = gCSIRXState[1].callbackCount.combinedEOF;
-    uint32_t baseEOL1  = gCSIRXState[1].callbackCount.combinedEOL;
+    baseEOF1  = gCSIRXState[1].callbackCount.combinedEOF;
+    baseEOL1  = gCSIRXState[1].callbackCount.combinedEOL;
 #endif
-    uint32_t baseTrigger = gCbuffTriggerCount;
-    uint32_t baseSwDone  = gMmwCascadeMCB.lvdsStreamcfg.lvdsStream.swFrameDoneCount;
-    uint32_t baseSkips   = gCbuffSkipCount;
+    baseTrigger = gCbuffTriggerCount;
+    baseSwDone  = gMmwCascadeMCB.lvdsStreamcfg.lvdsStream.swFrameDoneCount;
+    baseSkips   = gCbuffSkipCount;
+    MMWavePatch_clearFeFaults();
 
     /************************************************************************
      * Start the mmWave:
@@ -1304,10 +1625,42 @@ void MmwCascade_mmWaveTest (void)
     {
         test_print ("Error: mmWave start failed [Error code %d]\n", errCode);
         MCPI_setFeatureTestResult ("MMWave MSS Start", MCPI_TestResult_FAIL);
-        return;
+        feReason = "mmwave_start_failed";
+        MmwCascade_feRecordFailure(errCode);
+        MmwCascade_feReport("fe_start_retry", feAttempt, feReason);
+        if (MmwCascade_feTeardown() == false) { return; }
+        continue;
     }
 
     test_print ("MMWave MSS Start done\n");
+
+    /* CHIRP fix: confirm that both front ends are really streaming. */
+    feReason = MmwCascade_waitRfHealthy(baseEOF0, baseEOF1);
+    if (feReason == NULL)
+    {
+        feStarted = true;
+    }
+    else
+    {
+        test_print ("[FE] start attempt %u failed: %s -> resetting front ends\n",
+                    (unsigned)feAttempt, feReason);
+        MmwCascade_feRecordFailure(0);
+        MmwCascade_feReport("fe_start_retry", feAttempt, feReason);
+        if (MmwCascade_feTeardown() == false) { return; }
+    }
+    } /* for (feAttempt) */
+
+    if (feStarted == false)
+    {
+        test_print ("[FE] front ends failed to start after %u attempts\n", (unsigned)gFeStartMaxAttempts);
+        MmwCascade_feReport("fe_start_failed", gFeStartMaxAttempts, (feReason != NULL) ? feReason : "bringup_failed");
+        return;
+    }
+    MmwCascade_feReport("rf_started", gFeStartAttempt, "ok");
+    for (u32DevIdx = 0U; u32DevIdx < MMWAVE_RADAR_DEVICES; u32DevIdx++)
+    {
+        gFeRunFaultReported[u32DevIdx] = gMMWavePatchFeFault[u32DevIdx].totalCount;
+    }
 
     if (gActive.frame.numFrames == 0)
     {
@@ -1322,7 +1675,20 @@ void MmwCascade_mmWaveTest (void)
         }
         while (1)
         {
+            uint32_t dev;
             vTaskDelay(pdMS_TO_TICKS(100));
+
+            /* CHIRP fix: a front-end fault after a healthy start no longer freezes
+             * the MCU; report each new one on the CLI UART for the host. */
+            for (dev = 0U; dev < MMWAVE_RADAR_DEVICES; dev++)
+            {
+                if (gMMWavePatchFeFault[dev].totalCount != gFeRunFaultReported[dev])
+                {
+                    gFeRunFaultReported[dev] = gMMWavePatchFeFault[dev].totalCount;
+                    MmwCascade_feReport("fe_fault_running", gFeStartAttempt,
+                                        (dev == 0U) ? "master_mss_cpu_fault" : "slave_mss_cpu_fault");
+                }
+            }
         }
     }
     else
@@ -1617,6 +1983,12 @@ void MmwCascade_mmWaveTest (void)
             test_print("MMWave MSS close done.\n");
         }
 
+        /* The control task must be deleted before its mmWave semaphores are
+         * destroyed. Otherwise it can continue a SPI read while Drivers_close
+         * closes MIBSPI, which asserts on an outstanding transaction. Reuse
+         * the same ordered cleanup as startup recovery. stop/close above have
+         * already completed, so avoid issuing them again. */
+        if (MmwCascade_stopControlTask() == false) { return; }
         if (MMWave_deinit(gMmwCascadeMCB.mmWaveHandle, &errCode) < 0)
         {
             test_print("Error: mmWave deinit failed [Error code %d]\n", errCode);
@@ -1625,6 +1997,7 @@ void MmwCascade_mmWaveTest (void)
         {
             test_print("MMWave MSS deinit done.\n");
         }
+        gMmwCascadeMCB.mmWaveHandle = NULL;
     }
 
     return;
@@ -1783,6 +2156,16 @@ static void MmwCascade_initTask(void* args)
 
     /* Configure the Front-End. */
     MmwCascade_mmWaveTest();
+
+    /* A timed-out SPI owner must keep its driver objects and stack alive.
+     * Leave UART diagnostics available; a subsequent CCS reset can recover. */
+    if (gMmwCtrlTask != NULL)
+    {
+        gCliState = CLI_STATE_CAPTURE_DONE;
+        test_print("[FE] teardown incomplete; retaining drivers for active control task\n");
+        vTaskDelete(NULL);
+        return;
+    }
 
     /* Capture done — update state and safely delete CLI task before teardown */
     gCliState = CLI_STATE_CAPTURE_DONE;

@@ -110,4 +110,5 @@ obj_am273x/main_mss.oer5f: am273x\main_mss.c \
   C:\ti\mmwave_mcuplus_sdk_04_06_01_02\mmwave_mcuplus_sdk_04_06_01_02\ti\utils\test\cascade\am273x_LVDS_CLI\am273x\cascade_csirx.h \
   C:\ti\mmwave_mcuplus_sdk_04_06_01_02\mmwave_mcuplus_sdk_04_06_01_02\ti\utils\test\cascade\am273x_LVDS_CLI\am273x\cascade_lvds_stream.h \
   C:\ti\mmwave_mcuplus_sdk_04_06_01_02\mmwave_mcuplus_sdk_04_06_01_02\ti\utils\test\cascade\am273x_LVDS_CLI\am273x\app_cli_state.h \
-  C:\ti\mmwave_mcuplus_sdk_04_06_01_02\mmwave_mcuplus_sdk_04_06_01_02\ti\utils\test\cascade\am273x_LVDS_CLI\am273x\chirp_header.h
+  C:\ti\mmwave_mcuplus_sdk_04_06_01_02\mmwave_mcuplus_sdk_04_06_01_02\ti\utils\test\cascade\am273x_LVDS_CLI\am273x\chirp_header.h \
+  C:\ti\mmwave_mcuplus_sdk_04_06_01_02\mmwave_mcuplus_sdk_04_06_01_02\ti\utils\test\cascade\am273x_LVDS_CLI\am273x\mmwave_ctrl\mmwave_ctrl_patch.h
